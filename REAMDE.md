@@ -292,4 +292,3 @@ npm start
 
 ---
 
-**Optimization Tip:** If you want the README to auto-track the protocol (so an AI can't forget to update it), consider moving the message tables into a separate `PROTOCOL.md` and referencing it from both `README.md` and `server.js` via a comment like `// see PROTOCOL.md`. That way the protocol has a single source of truth, and adding a message type forces a doc update in exactly one place. You can also add a short `AGENTS.md` at the repo root that just says "read README.md section 10 before doing anything" — many AI tools scan for that filename automatically.
