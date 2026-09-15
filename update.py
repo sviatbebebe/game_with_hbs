@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-update_walls_terrain.py — обновление проекта:
-  * карта в 10 раз больше (200x150 тайлов)
-  * разные поверхности: трава, камень (стены), вода, каменный пол
-  * стены ломаются правой кнопкой мыши (ближний удар)
-  * враги агрятся на игрока, если в них попал его снаряд
-  * ограничена дальность полёта снаряда игрока
+update_enemies_v2.py — обновление проекта:
+  * больше врагов на карте
+  * три типа врагов (melee/квадрат, ranged/круг, wanderer/пятиугольник)
+  * инвентарь вверху экрана
+  * лут с врагов (35%) и с блоков (100%)
+  * улучшенные текстуры блоков
 
 Запуск из корня проекта:
-    python update_walls_terrain.py
-    python update_walls_terrain.py --dry-run
-    python update_walls_terrain.py --revert
+    python update_enemies_v2.py
+    python update_enemies_v2.py --dry-run
+    python update_enemies_v2.py --revert
 """
 
 import argparse
@@ -33,45 +33,26 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 3000;
 const TILE = 32;
-
-// Карта в 10 раз больше: 200x150 = 30 000 тайлов
 const MAP_W = 200;
 const MAP_H = 150;
 
 // Типы поверхности
-const T_GRASS = 0;   // трава, ходим
-const T_STONE = 1;   // каменная стена, ломается, блокирует движение и снаряды
-const T_WATER = 2;   // вода, блокирует движение, снаряды пролетают
-const T_FLOOR = 3;   // каменный пол, ходим
+const T_GRASS = 0;
+const T_STONE = 1;
+const T_WATER = 2;
+const T_FLOOR = 3;
 
-function isSolid(x, y) {
-  const tx = Math.floor(x / TILE);
-  const ty = Math.floor(y / TILE);
-  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
-  const t = map[ty][tx];
-  return t === T_STONE || t === T_WATER;
-}
-
-function blocksProjectile(x, y) {
-  const tx = Math.floor(x / TILE);
-  const ty = Math.floor(y / TILE);
-  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
-  return map[ty][tx] === T_STONE;
-}
-
-// ---------- генерация карты ----------
+// ---------- карта ----------
 const map = [];
 for (let y = 0; y < MAP_H; y++) {
   const row = [];
   for (let x = 0; x < MAP_W; x++) row.push(T_GRASS);
   map.push(row);
 }
-
-// границы — стены
 for (let x = 0; x < MAP_W; x++) { map[0][x] = T_STONE; map[MAP_H - 1][x] = T_STONE; }
 for (let y = 0; y < MAP_H; y++) { map[y][0] = T_STONE; map[y][MAP_W - 1] = T_STONE; }
 
-// пруды воды
+// пруды
 for (let i = 0; i < 30; i++) {
   const cx = 5 + Math.floor(Math.random() * (MAP_W - 10));
   const cy = 5 + Math.floor(Math.random() * (MAP_H - 10));
@@ -100,7 +81,7 @@ for (let i = 0; i < 40; i++) {
   }
 }
 
-// каменные стены (кластеры, ломаются)
+// стены
 for (let i = 0; i < 200; i++) {
   const cx = 2 + Math.floor(Math.random() * (MAP_W - 4));
   const cy = 2 + Math.floor(Math.random() * (MAP_H - 4));
@@ -108,18 +89,29 @@ for (let i = 0; i < 200; i++) {
   let x = cx, y = cy;
   for (let j = 0; j < size; j++) {
     if (x > 0 && y > 0 && x < MAP_W - 1 && y < MAP_H - 1) {
-      if (map[y][x] === T_GRASS || map[y][x] === T_FLOOR) {
-        map[y][x] = T_STONE;
-      }
+      if (map[y][x] === T_GRASS || map[y][x] === T_FLOOR) map[y][x] = T_STONE;
     }
     x += Math.floor(Math.random() * 3) - 1;
     y += Math.floor(Math.random() * 3) - 1;
   }
 }
 
-// HP стен (только для тех, что уже повреждены)
 const wallHP = new Map();
 const WALL_HP = 50;
+
+function isSolid(x, y) {
+  const tx = Math.floor(x / TILE);
+  const ty = Math.floor(y / TILE);
+  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
+  const t = map[ty][tx];
+  return t === T_STONE || t === T_WATER;
+}
+function blocksProjectile(x, y) {
+  const tx = Math.floor(x / TILE);
+  const ty = Math.floor(y / TILE);
+  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
+  return map[ty][tx] === T_STONE;
+}
 
 // ---------- статика ----------
 const MIME = {
@@ -159,31 +151,73 @@ const PLAYER_RADIUS = 14;
 const PLAYER_SPEED = 180;
 const PLAYER_HP = 100;
 
-const ENEMY_RADIUS = 14;
-const ENEMY_HP = 30;
-const ENEMY_DAMAGE = 10;
-const ENEMY_ATTACK_CD = 1000;
-const ENEMY_AGGRO = 350;
-const ENEMY_CHASE_SPEED = 90;
-const ENEMY_WANDER_SPEED = 35;
-const ENEMY_HOME_LEASH = 80;
-const ENEMY_AGGRO_MEMORY = 6000;   // мс — сколько помнит, что в него попали
+// --- типы врагов ---
+const ENEMY_TYPES = {
+  melee: {
+    hp: 300, speed: 220, radius: 16,
+    damage: 15, attackCD: 800, attackRange: 0, // contact
+    color: '#c0392b', shape: 'square',
+    loot: 'cheese',
+  },
+  ranged: {
+    hp: 80, speed: 180, radius: 14,
+    damage: 8, attackCD: 1500, attackRange: 320,
+    projectileSpeed: 350,
+    color: '#8e44ad', shape: 'circle',
+    loot: 'kuraga',
+  },
+  wanderer: {
+    hp: 120, speed: 60, chaseSpeed: 260, radius: 15,
+    damage: 12, attackCD: 900, attackRange: 0,
+    color: '#d35400', shape: 'pentagon',
+    loot: 'socks',
+  },
+};
 
-const GROUP_MIN = 4, GROUP_MAX = 8;
+const ENEMY_AGGRO = 350;
+const ENEMY_AGGRO_MEMORY = 6000;
+const ENEMY_HOME_LEASH = 80;
+
+const GROUP_MIN = 8, GROUP_MAX = 15;
 const GROUP_SIZE_MIN = 3, GROUP_SIZE_MAX = 6;
 const GROUP_SPAWN_DIST = 400;
 
 const PROJ_SPEED = 500;
 const PROJ_RADIUS = 5;
-const PROJ_DAMAGE = 10;
+const PROJ_DAMAGE = 25;
 const PROJ_TTL = 1.5;
-const PROJ_MAX_DIST = 400;         // ограничение дальности полёта снаряда
+const PROJ_MAX_DIST = 400;
 
 const MELEE_RANGE = 60;
 const MELEE_DAMAGE = 25;
-const MELEE_CD = 300;              // мс
+const MELEE_CD = 300;
 const playerMeleeLast = new Map();
 
+const LOOT_CHANCE = 0.35;
+
+// ---------- предметы ----------
+const ITEMS = {
+  cheese:  { name: 'Сыр',    color: '#f1c40f' },
+  kuraga:  { name: 'Курага', color: '#e67e22' },
+  socks:   { name: 'Носки',  color: '#3498db' },
+  stone:   { name: 'Камень', color: '#7f8c8d' },
+  floor:   { name: 'Плита',  color: '#95a5a6' },
+  grass:   { name: 'Трава',  color: '#27ae60' },
+  water:   { name: 'Вода',   color: '#2980b9' },
+};
+const TILE_TO_ITEM = {
+  [T_STONE]: 'stone',
+  [T_FLOOR]: 'floor',
+  [T_GRASS]: 'grass',
+  [T_WATER]: 'water',
+};
+
+function addItem(player, itemId) {
+  if (!player.inventory) player.inventory = {};
+  player.inventory[itemId] = (player.inventory[itemId] || 0) + 1;
+}
+
+// ---------- спавн ----------
 function findSpawn() {
   for (let i = 0; i < 500; i++) {
     const tx = 2 + Math.floor(Math.random() * (MAP_W - 4));
@@ -195,25 +229,30 @@ function findSpawn() {
   return { x: TILE * 2, y: TILE * 2 };
 }
 
-function broadcast(msg) {
-  const data = JSON.stringify(msg);
-  for (const ws of wss.clients) if (ws.readyState === 1) ws.send(data);
+function pickEnemyType() {
+  const r = Math.random();
+  if (r < 0.35) return 'melee';
+  if (r < 0.60) return 'ranged';
+  return 'wanderer';
 }
 
-function lobbyState() {
+function makeEnemy(type, x, y) {
+  const cfg = ENEMY_TYPES[type];
+  const id = nextEnemyId++;
   return {
-    type: 'lobby',
-    hostId,
-    players: [...players.values()].map(p => ({
-      id: p.id, name: p.name, ready: readySet.has(p.id),
-    })),
+    id, type, x, y,
+    hp: cfg.hp, maxHp: cfg.hp,
+    radius: cfg.radius,
+    lastHit: 0,
+    homeX: x, homeY: y,
+    aggroUntil: 0,
+    wanderAngle: Math.random() * Math.PI * 2,
+    wanderUntil: 0,
   };
 }
-function broadcastLobby() { broadcast(lobbyState()); }
 
-// ---------- спавн врагов группами ----------
 function spawnEnemyGroup() {
-  for (let attempt = 0; attempt < 300; attempt++) {
+  for (let attempt = 0; attempt < 400; attempt++) {
     const tx = 3 + Math.floor(Math.random() * (MAP_W - 6));
     const ty = 3 + Math.floor(Math.random() * (MAP_H - 6));
     if (map[ty][tx] !== T_GRASS && map[ty][tx] !== T_FLOOR) continue;
@@ -228,22 +267,15 @@ function spawnEnemyGroup() {
 
     const size = GROUP_SIZE_MIN + Math.floor(Math.random() * (GROUP_SIZE_MAX - GROUP_SIZE_MIN + 1));
     let placed = 0;
-    for (let i = 0; i < size * 3 && placed < size; i++) {
+    for (let i = 0; i < size * 4 && placed < size; i++) {
       const ang = Math.random() * Math.PI * 2;
-      const rad = 20 + Math.random() * 80;
+      const rad = 20 + Math.random() * 100;
       const ex = cx + Math.cos(ang) * rad;
       const ey = cy + Math.sin(ang) * rad;
       if (isSolid(ex, ey)) continue;
-      const id = nextEnemyId++;
-      enemies.set(id, {
-        id, x: ex, y: ey,
-        hp: ENEMY_HP, maxHp: ENEMY_HP,
-        radius: ENEMY_RADIUS,
-        speed: ENEMY_CHASE_SPEED,
-        lastHit: 0,
-        homeX: ex, homeY: ey,
-        aggroUntil: 0,
-      });
+      const type = pickEnemyType();
+      const e = makeEnemy(type, ex, ey);
+      enemies.set(e.id, e);
       placed++;
     }
     if (placed > 0) return true;
@@ -267,6 +299,22 @@ function countGroups() {
   return groups;
 }
 
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  for (const ws of wss.clients) if (ws.readyState === 1) ws.send(data);
+}
+
+function lobbyState() {
+  return {
+    type: 'lobby',
+    hostId,
+    players: [...players.values()].map(p => ({
+      id: p.id, name: p.name, ready: readySet.has(p.id),
+    })),
+  };
+}
+function broadcastLobby() { broadcast(lobbyState()); }
+
 function resetGame() {
   enemies.clear();
   projectiles.clear();
@@ -276,6 +324,7 @@ function resetGame() {
     p.x = s.x; p.y = s.y;
     p.hp = p.maxHp;
     p.dirX = 0; p.dirY = 0;
+    p.inventory = {};
   }
 }
 
@@ -293,7 +342,7 @@ function startGame() {
   });
 }
 
-// ---------- механика удара по стене ----------
+// ---------- удар по стене ----------
 function meleeStrike(p, angle) {
   const now = Date.now();
   const last = playerMeleeLast.get(p.id) || 0;
@@ -315,6 +364,7 @@ function meleeStrike(p, angle) {
     if (next <= 0) {
       map[ty][tx] = T_FLOOR;
       wallHP.delete(key);
+      addItem(p, TILE_TO_ITEM[T_STONE]);
       broadcast({ type: 'tileChange', tx, ty, tile: T_FLOOR });
     } else {
       wallHP.set(key, next);
@@ -334,6 +384,7 @@ wss.on('connection', (ws) => {
     radius: PLAYER_RADIUS,
     hp: PLAYER_HP, maxHp: PLAYER_HP,
     dirX: 0, dirY: 0,
+    inventory: {},
   };
   players.set(id, player);
   ws.playerId = id;
@@ -348,6 +399,7 @@ wss.on('connection', (ws) => {
     players: [...players.values()],
     enemies: [...enemies.values()],
     projectiles: [...projectiles.values()],
+    items: ITEMS,
   }));
 
   if (gameState === 'playing') {
@@ -397,8 +449,10 @@ wss.on('connection', (ws) => {
         startX: sx, startY: sy,
         vx: Math.cos(a) * PROJ_SPEED,
         vy: Math.sin(a) * PROJ_SPEED,
+        ownerType: 'player',
         ownerId: id, ttl: PROJ_TTL,
         maxDist: PROJ_MAX_DIST,
+        damage: PROJ_DAMAGE,
       });
     } else if (msg.type === 'melee') {
       if (gameState !== 'playing') return;
@@ -433,7 +487,9 @@ function movePlayer(p, dt) {
 
 function updateEnemies(dt, now) {
   for (const e of enemies.values()) {
+    const cfg = ENEMY_TYPES[e.type];
     const aggroMemory = now < (e.aggroUntil || 0);
+
     let target = null, minD = Infinity;
     for (const p of players.values()) {
       const d = Math.hypot(p.x - e.x, p.y - e.y);
@@ -443,21 +499,63 @@ function updateEnemies(dt, now) {
     }
 
     if (!target) {
-      const dx = e.homeX - e.x, dy = e.homeY - e.y;
-      const dl = Math.hypot(dx, dy);
-      if (dl > ENEMY_HOME_LEASH) {
-        const nx = e.x + (dx / dl) * ENEMY_WANDER_SPEED * dt;
-        const ny = e.y + (dy / dl) * ENEMY_WANDER_SPEED * dt;
-        if (!isSolid(nx, e.y)) e.x = nx;
-        if (!isSolid(e.x, ny)) e.y = ny;
+      if (e.type === 'wanderer') {
+        if (now > (e.wanderUntil || 0)) {
+          e.wanderAngle = Math.random() * Math.PI * 2;
+          e.wanderUntil = now + 1500 + Math.random() * 2500;
+        }
+        const sp = cfg.speed;
+        const nx = e.x + Math.cos(e.wanderAngle) * sp * dt;
+        const ny = e.y + Math.sin(e.wanderAngle) * sp * dt;
+        if (!isSolid(nx, e.y)) e.x = nx; else e.wanderAngle = Math.random() * Math.PI * 2;
+        if (!isSolid(e.x, ny)) e.y = ny; else e.wanderAngle = Math.random() * Math.PI * 2;
+      } else {
+        const dx = e.homeX - e.x, dy = e.homeY - e.y;
+        const dl = Math.hypot(dx, dy);
+        if (dl > ENEMY_HOME_LEASH) {
+          const nx = e.x + (dx / dl) * 40 * dt;
+          const ny = e.y + (dy / dl) * 40 * dt;
+          if (!isSolid(nx, e.y)) e.x = nx;
+          if (!isSolid(e.x, ny)) e.y = ny;
+        }
       }
       continue;
     }
 
-    if (minD < e.radius + target.radius + 4) {
-      if (now - e.lastHit > ENEMY_ATTACK_CD) {
-        target.hp -= ENEMY_DAMAGE;
+    if (e.type === 'ranged') {
+      if (minD < cfg.attackRange) {
+        if (now - e.lastHit > cfg.attackCD) {
+          e.lastHit = now;
+          const a = Math.atan2(target.y - e.y, target.x - e.x);
+          const pid = nextProjectileId++;
+          projectiles.set(pid, {
+            id: pid,
+            x: e.x + Math.cos(a) * (e.radius + 4),
+            y: e.y + Math.sin(a) * (e.radius + 4),
+            startX: e.x, startY: e.y,
+            vx: Math.cos(a) * cfg.projectileSpeed,
+            vy: Math.sin(a) * cfg.projectileSpeed,
+            ownerType: 'enemy', ownerId: e.id,
+            ttl: 2, maxDist: cfg.attackRange + 60,
+            damage: cfg.damage,
+          });
+        }
+        continue;
+      }
+      const dx = target.x - e.x, dy = target.y - e.y;
+      const l = Math.hypot(dx, dy) || 1;
+      const nx = e.x + (dx / l) * cfg.speed * dt;
+      const ny = e.y + (dy / l) * cfg.speed * dt;
+      if (!isSolid(nx, e.y)) e.x = nx;
+      if (!isSolid(e.x, ny)) e.y = ny;
+      continue;
+    }
+
+    // melee / wanderer — контактный бой
+    if (minD < e.radius + target.radius + 8) {
+      if (now - e.lastHit > cfg.attackCD) {
         e.lastHit = now;
+        target.hp -= cfg.damage;
         if (target.hp <= 0) {
           const s = findSpawn();
           target.x = s.x; target.y = s.y;
@@ -466,11 +564,11 @@ function updateEnemies(dt, now) {
       }
       continue;
     }
-
+    const sp = (e.type === 'wanderer') ? cfg.chaseSpeed : cfg.speed;
     const dx = target.x - e.x, dy = target.y - e.y;
     const l = Math.hypot(dx, dy) || 1;
-    const nx = e.x + (dx / l) * e.speed * dt;
-    const ny = e.y + (dy / l) * e.speed * dt;
+    const nx = e.x + (dx / l) * sp * dt;
+    const ny = e.y + (dy / l) * sp * dt;
     if (!isSolid(nx, e.y)) e.x = nx;
     if (!isSolid(e.x, ny)) e.y = ny;
   }
@@ -488,18 +586,41 @@ function updateProjectiles(dt, now) {
       continue;
     }
 
-    let hit = false;
-    for (const e of enemies.values()) {
-      if (Math.hypot(pr.x - e.x, pr.y - e.y) < e.radius + PROJ_RADIUS) {
-        e.hp -= PROJ_DAMAGE;
-        // агрессия по попаданию
-        e.aggroUntil = now + ENEMY_AGGRO_MEMORY;
-        if (e.hp <= 0) enemies.delete(e.id);
-        hit = true;
-        break;
+    if (pr.ownerType === 'enemy') {
+      let hit = false;
+      for (const p of players.values()) {
+        if (Math.hypot(pr.x - p.x, pr.y - p.y) < p.radius + PROJ_RADIUS) {
+          p.hp -= pr.damage || 8;
+          if (p.hp <= 0) {
+            const s = findSpawn();
+            p.x = s.x; p.y = s.y;
+            p.hp = p.maxHp;
+          }
+          hit = true;
+          break;
+        }
       }
+      if (hit) projectiles.delete(id);
+    } else {
+      let hit = false;
+      for (const e of enemies.values()) {
+        if (Math.hypot(pr.x - e.x, pr.y - e.y) < e.radius + PROJ_RADIUS) {
+          e.hp -= pr.damage || PROJ_DAMAGE;
+          e.aggroUntil = now + ENEMY_AGGRO_MEMORY;
+          if (e.hp <= 0) {
+            const cfg = ENEMY_TYPES[e.type];
+            const killer = players.get(pr.ownerId);
+            if (killer && Math.random() < LOOT_CHANCE) {
+              addItem(killer, cfg.loot);
+            }
+            enemies.delete(e.id);
+          }
+          hit = true;
+          break;
+        }
+      }
+      if (hit) projectiles.delete(id);
     }
-    if (hit) projectiles.delete(id);
   }
 }
 
@@ -525,8 +646,11 @@ setInterval(() => {
 setInterval(() => {
   if (gameState !== 'playing' || players.size === 0) return;
   const g = countGroups();
-  if (g < GROUP_MIN) spawnEnemyGroup();
-}, 5000);
+  if (g < GROUP_MIN) {
+    spawnEnemyGroup();
+    if (g + 1 < GROUP_MIN) spawnEnemyGroup();
+  }
+}, 2500);
 
 // ---------- запуск ----------
 function lanIPs() {
@@ -567,7 +691,6 @@ FILES["public/index.html"] = r'''<!DOCTYPE html>
   html, body { margin: 0; padding: 0; background: #111; color: #eee;
                overflow: hidden; height: 100%; font-family: monospace; }
   canvas { display: block; }
-
   #lobby {
     position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
     background: #111;
@@ -675,6 +798,7 @@ FILES["public/js/net.js"] = r'''export class Net {
     this.enemies = new Map();
     this.projectiles = new Map();
     this.map = null;
+    this.items = {};
     this.ws = null;
     this.handlers = {};
   }
@@ -700,6 +824,7 @@ FILES["public/js/net.js"] = r'''export class Net {
       this.hostId = msg.hostId;
       this.gameState = msg.gameState;
       this.map = msg.map;
+      this.items = msg.items || {};
       this.players.clear(); msg.players.forEach(p => this.players.set(p.id, p));
       this.enemies.clear(); msg.enemies.forEach(e => this.enemies.set(e.id, e));
       this.projectiles.clear(); msg.projectiles.forEach(p => this.projectiles.set(p.id, p));
@@ -716,7 +841,7 @@ FILES["public/js/net.js"] = r'''export class Net {
       for (const l of msg.players) {
         if (!this.players.has(l.id)) {
           this.players.set(l.id, { id: l.id, name: l.name, ready: l.ready,
-            x: 0, y: 0, radius: 14, hp: 100, maxHp: 100 });
+            x: 0, y: 0, radius: 14, hp: 100, maxHp: 100, inventory: {} });
         }
       }
       this.emit('lobby', msg);
@@ -780,21 +905,10 @@ const hud = document.getElementById('hud');
 const TILE = 32;
 const CAM_LERP = 0.15;
 
-// Цвета поверхностей
 const T_GRASS = 0;
 const T_STONE = 1;
 const T_WATER = 2;
 const T_FLOOR = 3;
-
-function tileColor(t) {
-  switch (t) {
-    case T_GRASS: return '#2f4a2a';
-    case T_STONE: return '#5a5a5a';
-    case T_WATER: return '#1d3f63';
-    case T_FLOOR: return '#3b3b3b';
-    default: return '#000';
-  }
-}
 
 const net = new Net();
 const input = new Input();
@@ -815,9 +929,7 @@ window.addEventListener('mousemove', (e) => {
   input.mouse.x = e.clientX;
   input.mouse.y = e.clientY;
 });
-
 window.addEventListener('contextmenu', (e) => e.preventDefault());
-
 window.addEventListener('mousedown', (e) => {
   if (!myPlayer || net.gameState !== 'playing') return;
   const wx = e.clientX + camera.x;
@@ -827,15 +939,125 @@ window.addEventListener('mousedown', (e) => {
   else if (e.button === 2) net.sendMelee(angle);
 });
 
+// ---------- процедурный шум для текстур ----------
+function hash2(x, y) {
+  let h = (x * 374761393 + y * 668265263) | 0;
+  h = (h ^ (h >> 13)) * 1274126177;
+  h = (h ^ (h >> 16)) >>> 0;
+  return h / 4294967296;
+}
+
+// ---------- отрисовка тайлов ----------
+function drawTile(tx, ty, t, px, py) {
+  const h = hash2(tx, ty);
+  if (t === T_GRASS) {
+    ctx.fillStyle = h > 0.5 ? '#2f4a2a' : '#2b4426';
+    ctx.fillRect(px, py, TILE, TILE);
+    // травинки
+    for (let i = 0; i < 5; i++) {
+      const rx = hash2(tx * 7 + i, ty * 13 + i);
+      const ry = hash2(tx * 13 + i, ty * 7 + i);
+      const x = px + 3 + rx * (TILE - 6);
+      const y = py + 3 + ry * (TILE - 6);
+      ctx.fillStyle = h > 0.5 ? '#3e5e35' : '#26401f';
+      ctx.fillRect(x, y, 2, 3);
+    }
+  } else if (t === T_STONE) {
+    ctx.fillStyle = '#6a6a6a';
+    ctx.fillRect(px, py, TILE, TILE);
+    ctx.fillStyle = '#565656';
+    ctx.fillRect(px, py + TILE - 6, TILE, 6);
+    ctx.fillRect(px + TILE - 6, py, 6, TILE);
+    ctx.fillStyle = '#7d7d7d';
+    ctx.fillRect(px, py, TILE, 4);
+    ctx.fillRect(px, py, 4, TILE);
+    // трещины
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px + 6 + h * 8, py + 6);
+    ctx.lineTo(px + 10 + h * 12, py + TILE - 6);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(px + 4, py + 12 + h * 10);
+    ctx.lineTo(px + TILE - 4, py + 18 + h * 8);
+    ctx.stroke();
+    // крапинки
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.fillRect(px + 8, py + 8, 2, 2);
+    ctx.fillRect(px + TILE - 12, py + TILE - 12, 2, 2);
+    ctx.strokeStyle = '#2b2b2b';
+    ctx.strokeRect(px + 0.5, py + 0.5, TILE - 1, TILE - 1);
+  } else if (t === T_WATER) {
+    ctx.fillStyle = '#1a3a5c';
+    ctx.fillRect(px, py, TILE, TILE);
+    ctx.strokeStyle = 'rgba(120,180,255,0.35)';
+    ctx.lineWidth = 1;
+    for (let k = 0; k < 3; k++) {
+      const y0 = py + 6 + k * 9 + ((h * 3) | 0);
+      ctx.beginPath();
+      for (let x = 0; x <= TILE; x += 4) {
+        const yy = y0 + Math.sin((x + h * 20) * 0.5) * 1.5;
+        if (x === 0) ctx.moveTo(px + x, yy);
+        else ctx.lineTo(px + x, yy);
+      }
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(200,230,255,0.25)';
+    for (let i = 0; i < 3; i++) {
+      const sx = px + 4 + hash2(tx * 3 + i, ty * 11 + i) * (TILE - 8);
+      const sy = py + 4 + hash2(tx * 11 + i, ty * 3 + i) * (TILE - 8);
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+  } else if (t === T_FLOOR) {
+    ctx.fillStyle = '#3a3a3a';
+    ctx.fillRect(px, py, TILE, TILE);
+    ctx.fillStyle = h > 0.5 ? '#3e3e3e' : '#363636';
+    ctx.fillRect(px + 2, py + 2, TILE - 4, TILE - 4);
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px + 1, py + 1, TILE - 2, TILE - 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    ctx.fillRect(px + 6, py + 6, 3, 3);
+    ctx.fillRect(px + TILE - 10, py + TILE - 10, 3, 3);
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.fillRect(px + TILE - 8, py + 6, 3, 3);
+  }
+}
+
+// ---------- отрисовка фигур врагов ----------
+function drawShape(shape, cx, cy, r, fill, stroke) {
+  ctx.fillStyle = fill;
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  if (shape === 'square') {
+    ctx.rect(cx - r, cy - r, r * 2, r * 2);
+  } else if (shape === 'circle') {
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  } else if (shape === 'pentagon') {
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI / 2 + (i * 2 * Math.PI) / 5;
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  } else {
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  }
+  ctx.fill();
+  ctx.stroke();
+}
+
 // ---------- лобби ----------
 function renderLobby() {
   const isHost = net.id === net.hostId;
   startBtn.style.display = isHost ? '' : 'none';
 
   const me = net.players.get(net.id);
-  if (me && document.activeElement !== nameInput) {
-    nameInput.value = me.name || '';
-  }
+  if (me && document.activeElement !== nameInput) nameInput.value = me.name || '';
   if (me && me.ready) {
     readyBtn.classList.add('ready-on');
     readyBtn.textContent = 'Не готов';
@@ -850,11 +1072,9 @@ function renderLobby() {
     const li = document.createElement('li');
     const name = document.createElement('span');
     name.textContent = p.name || ('Игрок ' + p.id);
-
     const badges = document.createElement('span');
     badges.style.display = 'flex';
     badges.style.gap = '6px';
-
     if (p.id === net.hostId) {
       const b = document.createElement('span');
       b.className = 'badge host'; b.textContent = 'ХОСТ';
@@ -865,7 +1085,6 @@ function renderLobby() {
       b.className = 'badge ready'; b.textContent = 'ГОТОВ';
       badges.appendChild(b);
     }
-
     li.appendChild(name);
     li.appendChild(badges);
     playersListEl.appendChild(li);
@@ -907,12 +1126,67 @@ net.on('state', () => {
   if (net.gameState === 'playing' && gameUIEl.style.display === 'none') showGame();
 });
 
-// ---------- движение ----------
 setInterval(() => {
   if (net.gameState !== 'playing') return;
   const mv = input.getMove();
   net.sendMove(mv.dx, mv.dy);
 }, 50);
+
+// ---------- инвентарь ----------
+function drawInventory(player) {
+  const inv = player.inventory || {};
+  const items = Object.entries(inv);
+  const slotW = 64, slotH = 52, gap = 6;
+  const y = 10;
+
+  if (items.length === 0) {
+    const w = 200;
+    const x = (canvas.width - w) / 2;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(x, y, w, slotH);
+    ctx.strokeStyle = '#333';
+    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, slotH - 1);
+    ctx.fillStyle = '#666';
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Инвентарь пуст', canvas.width / 2, y + slotH / 2);
+    return;
+  }
+
+  const totalW = items.length * slotW + (items.length - 1) * gap;
+  const x0 = (canvas.width - totalW) / 2;
+
+  for (let i = 0; i < items.length; i++) {
+    const id = items[i][0];
+    const count = items[i][1];
+    const meta = (net.items && net.items[id]) || { name: id, color: '#888' };
+    const x = x0 + i * (slotW + gap);
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(x, y, slotW, slotH);
+    ctx.strokeStyle = '#444';
+    ctx.strokeRect(x + 0.5, y + 0.5, slotW - 1, slotH - 1);
+    // иконка
+    ctx.fillStyle = meta.color;
+    ctx.fillRect(x + 6, y + 6, slotW - 12, 24);
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+    ctx.strokeRect(x + 6.5, y + 6.5, slotW - 13, 23);
+    // имя
+    ctx.fillStyle = '#ddd';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(meta.name, x + slotW / 2, y + 40);
+    // счётчик
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(x + slotW - 10, y + 10, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px monospace';
+    ctx.fillText(String(count), x + slotW - 10, y + 10);
+  }
+}
 
 // ---------- отрисовка ----------
 function draw() {
@@ -942,33 +1216,30 @@ function draw() {
 
   for (let ty = y0; ty < y1; ty++) {
     for (let tx = x0; tx < x1; tx++) {
-      const t = tiles[ty][tx];
-      ctx.fillStyle = tileColor(t);
-      ctx.fillRect(tx * TILE + ox, ty * TILE + oy, TILE, TILE);
-      if (t === T_GRASS || t === T_FLOOR) {
-        ctx.strokeStyle = 'rgba(0,0,0,0.15)';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(tx * TILE + ox + 0.5, ty * TILE + oy + 0.5, TILE - 1, TILE - 1);
-      } else if (t === T_WATER) {
-        ctx.strokeStyle = 'rgba(120,180,255,0.10)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(tx * TILE + ox + 4, ty * TILE + oy + TILE / 2);
-        ctx.lineTo(tx * TILE + ox + TILE - 4, ty * TILE + oy + TILE / 2);
-        ctx.stroke();
-      }
+      drawTile(tx, ty, tiles[ty][tx], tx * TILE + ox, ty * TILE + oy);
     }
   }
 
   // враги
   for (const e of net.enemies.values()) {
     const sx = e.x + ox, sy = e.y + oy;
-    ctx.fillStyle = '#c0392b';
-    ctx.beginPath(); ctx.arc(sx, sy, e.radius, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#e74c3c'; ctx.lineWidth = 2; ctx.stroke();
-    const hpW = 30, hpX = sx - hpW / 2, hpY = sy - e.radius - 8;
-    ctx.fillStyle = '#222'; ctx.fillRect(hpX, hpY, hpW, 4);
-    ctx.fillStyle = '#e74c3c';
+    const shape = e.type === 'melee' ? 'square'
+                : e.type === 'ranged' ? 'circle'
+                : 'pentagon';
+    const fill = e.type === 'melee' ? '#c0392b'
+               : e.type === 'ranged' ? '#8e44ad'
+               : '#d35400';
+    const stroke = e.type === 'melee' ? '#e74c3c'
+                 : e.type === 'ranged' ? '#a569bd'
+                 : '#e67e22';
+    drawShape(shape, sx, sy, e.radius, fill, stroke);
+
+    const hpW = 34;
+    const hpX = sx - hpW / 2;
+    const hpY = sy - e.radius - 9;
+    ctx.fillStyle = '#222';
+    ctx.fillRect(hpX, hpY, hpW, 4);
+    ctx.fillStyle = stroke;
     ctx.fillRect(hpX, hpY, hpW * (e.hp / e.maxHp), 4);
   }
 
@@ -992,8 +1263,14 @@ function draw() {
   // снаряды
   for (const pr of net.projectiles.values()) {
     const sx = pr.x + ox, sy = pr.y + oy;
-    ctx.fillStyle = '#f1c40f';
-    ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
+    if (pr.ownerType === 'enemy') {
+      ctx.fillStyle = '#e67e22';
+      ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#d35400'; ctx.lineWidth = 1; ctx.stroke();
+    } else {
+      ctx.fillStyle = '#f1c40f';
+      ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
+    }
   }
 
   // прицел
@@ -1008,6 +1285,10 @@ function draw() {
     ctx.stroke();
   }
 
+  // инвентарь
+  drawInventory(myPlayer);
+
+  // HUD (снизу слева, чтобы не мешать инвентарю)
   hud.textContent = 'HP: ' + Math.max(0, Math.round(myPlayer.hp)) + '/' + myPlayer.maxHp
                   + '   Врагов: ' + net.enemies.size;
 }
@@ -1065,7 +1346,7 @@ def main() -> int:
         print("== revert ==")
         return revert()
 
-    print("== update_walls_terrain ==  (" +
+    print("== update_enemies_v2 ==  (" +
           ("dry-run" if args.dry_run else "apply") + ")\n")
 
     for name, content in FILES.items():
@@ -1082,6 +1363,11 @@ def main() -> int:
     print("  npm start")
     print("Откройте http://localhost:3000 с Ctrl+Shift+R.")
     print("Управление: WASD — движение, ЛКМ — выстрел, ПКМ — удар по стене.")
+    print("")
+    print("Враги:")
+    print("  Квадрат (ближник)   — 300 HP, быстрый, бьёт в упор, лут: Сыр")
+    print("  Круг   (дальник)    — 80 HP, обычная скорость, стреляет, лут: Курага")
+    print("  Пятиуг.(блуждающий) — 120 HP, бродит, при агре разгон, лут: Носки")
     return 0
 
 

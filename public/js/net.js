@@ -7,6 +7,7 @@ export class Net {
     this.enemies = new Map();
     this.projectiles = new Map();
     this.map = null;
+    this.items = {};
     this.ws = null;
     this.handlers = {};
   }
@@ -32,6 +33,7 @@ export class Net {
       this.hostId = msg.hostId;
       this.gameState = msg.gameState;
       this.map = msg.map;
+      this.items = msg.items || {};
       this.players.clear(); msg.players.forEach(p => this.players.set(p.id, p));
       this.enemies.clear(); msg.enemies.forEach(e => this.enemies.set(e.id, e));
       this.projectiles.clear(); msg.projectiles.forEach(p => this.projectiles.set(p.id, p));
@@ -48,7 +50,7 @@ export class Net {
       for (const l of msg.players) {
         if (!this.players.has(l.id)) {
           this.players.set(l.id, { id: l.id, name: l.name, ready: l.ready,
-            x: 0, y: 0, radius: 14, hp: 100, maxHp: 100 });
+            x: 0, y: 0, radius: 14, hp: 100, maxHp: 100, inventory: {} });
         }
       }
       this.emit('lobby', msg);
