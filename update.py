@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-update_to_radmin_ws.py
+create_radmin_rpg.py
 
-Обновляет проект до версии с Radmin-IP + WebSocket (Node.js сервер).
-Удаляет старые файлы (index.html, style.css, js/) и создаёт новые:
+Создаёт полный проект кооп-RPG через Radmin-IP + WebSocket с нуля:
+
     package.json
     server.js
-    public/index.html
-    public/style.css
-    public/js/{main,input,camera,world,player,net}.js
+    public/
+      index.html
+      style.css
+      js/
+        main.js
+        input.js
+        camera.js
+        world.js
+        player.js
+        net.js
 
-Запуск: python update_to_radmin_ws.py
-(запускать в корне проекта, где лежал старый index.html)
+Запуск:
+    python create_radmin_rpg.py
+
+Скрипт создаёт все папки и файлы в текущей директории.
+Существующие файлы будут перезаписаны.
 """
 
 from pathlib import Path
-import shutil
-import sys
 
 FILES = {}
 
@@ -511,35 +519,41 @@ requestAnimationFrame(loop);
 
 def main() -> None:
     root = Path.cwd()
-    print(f"Корень проекта: {root}\n")
+    print(f"Создаю проект в: {root}\n")
 
-    # ---------- 1. удаляем старые файлы ----------
-    old_items = ["index.html", "style.css", "js"]
-    for item in old_items:
-        p = root / item
-        if p.exists():
-            if p.is_dir():
-                shutil.rmtree(p)
-                print(f"  удалена папка  {item}/")
-            else:
-                p.unlink()
-                print(f"  удалён файл    {item}")
-
-    # ---------- 2. пишем новые файлы ----------
-    print()
+    created = []
     for rel_path, content in FILES.items():
         path = root / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8", newline="\n")
-        print(f"  создан  {rel_path}")
+        created.append(rel_path)
 
-    # ---------- 3. что дальше ----------
-    print("\nГотово! Следующие шаги:")
+    print(f"Готово. Создано файлов: {len(created)}\n")
+    for rel in created:
+        print(f"  {rel}")
+
+    print("\nСтруктура проекта:")
+    print("  package.json")
+    print("  server.js")
+    print("  public/")
+    print("    index.html")
+    print("    style.css")
+    print("    js/")
+    print("      main.js")
+    print("      input.js")
+    print("      camera.js")
+    print("      world.js")
+    print("      player.js")
+    print("      net.js")
+
+    print("\nСледующие шаги:")
     print("  1. npm install")
     print("  2. npm start")
-    print("  3. Открой http://localhost:3000 (ты — хост)")
-    print("  4. Друг открывает http://<твой-radmin-ip>:3000")
-    print("  5. Если что-то не так — смотри раздел «Если не коннектится» в инструкции.")
+    print("  3. Ты (хост):  http://localhost:3000")
+    print("  4. Друг:       http://<твой-radmin-ip>:3000")
+    print()
+    print("Если не коннектится — разреши Node.js в брандмауэре Windows")
+    print("(частные сети) и проверь, что Radmin VPN активен у обоих.")
 
 
 if __name__ == "__main__":

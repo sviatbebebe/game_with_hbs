@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Co-op RPG</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="game" width="960" height="640"></canvas>
+
+  <div id="menu">
+    <h1>Co-op RPG</h1>
+    <input id="name" placeholder="Твоё имя" maxlength="12" value="Player">
+
+    <label for="hostIp" class="label">IP хоста (Radmin)</label>
+    <input id="hostIp" placeholder="оставь пустым, если ты хост">
+
+    <button id="playBtn">Подключиться</button>
+    <p id="status"></p>
+    <p id="selfHint" class="hint"></p>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
