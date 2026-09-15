@@ -16,6 +16,22 @@ const hud = document.getElementById('hud');
 const TILE = 32;
 const CAM_LERP = 0.15;
 
+// Цвета поверхностей
+const T_GRASS = 0;
+const T_STONE = 1;
+const T_WATER = 2;
+const T_FLOOR = 3;
+
+function tileColor(t) {
+  switch (t) {
+    case T_GRASS: return '#2f4a2a';
+    case T_STONE: return '#5a5a5a';
+    case T_WATER: return '#1d3f63';
+    case T_FLOOR: return '#3b3b3b';
+    default: return '#000';
+  }
+}
+
 const net = new Net();
 const input = new Input();
 
@@ -35,13 +51,16 @@ window.addEventListener('mousemove', (e) => {
   input.mouse.x = e.clientX;
   input.mouse.y = e.clientY;
 });
+
+window.addEventListener('contextmenu', (e) => e.preventDefault());
+
 window.addEventListener('mousedown', (e) => {
-  if (e.button !== 0) return;
-  if (net.gameState !== 'playing' || !myPlayer) return;
+  if (!myPlayer || net.gameState !== 'playing') return;
   const wx = e.clientX + camera.x;
   const wy = e.clientY + camera.y;
   const angle = Math.atan2(wy - myPlayer.y, wx - myPlayer.x);
-  net.sendAttack(angle);
+  if (e.button === 0) net.sendAttack(angle);
+  else if (e.button === 2) net.sendMelee(angle);
 });
 
 // ---------- лобби ----------
@@ -154,21 +173,30 @@ function draw() {
   const tiles = mapData.tiles;
   const x0 = Math.max(0, Math.floor(camera.x / TILE));
   const y0 = Math.max(0, Math.floor(camera.y / TILE));
-  const x1 = Math.min(mapData.w, Math.ceil((camera.x + canvas.width) / TILE));
-  const y1 = Math.min(mapData.h, Math.ceil((camera.y + canvas.height) / TILE));
+  const x1 = Math.min(mapData.w, Math.ceil((camera.x + canvas.width) / TILE) + 1);
+  const y1 = Math.min(mapData.h, Math.ceil((camera.y + canvas.height) / TILE) + 1);
 
   for (let ty = y0; ty < y1; ty++) {
     for (let tx = x0; tx < x1; tx++) {
-      const isWall = tiles[ty][tx] === 1;
-      ctx.fillStyle = isWall ? '#333' : '#1e1e1e';
+      const t = tiles[ty][tx];
+      ctx.fillStyle = tileColor(t);
       ctx.fillRect(tx * TILE + ox, ty * TILE + oy, TILE, TILE);
-      if (!isWall) {
-        ctx.strokeStyle = '#262626'; ctx.lineWidth = 1;
+      if (t === T_GRASS || t === T_FLOOR) {
+        ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+        ctx.lineWidth = 1;
         ctx.strokeRect(tx * TILE + ox + 0.5, ty * TILE + oy + 0.5, TILE - 1, TILE - 1);
+      } else if (t === T_WATER) {
+        ctx.strokeStyle = 'rgba(120,180,255,0.10)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(tx * TILE + ox + 4, ty * TILE + oy + TILE / 2);
+        ctx.lineTo(tx * TILE + ox + TILE - 4, ty * TILE + oy + TILE / 2);
+        ctx.stroke();
       }
     }
   }
 
+  // враги
   for (const e of net.enemies.values()) {
     const sx = e.x + ox, sy = e.y + oy;
     ctx.fillStyle = '#c0392b';
@@ -180,6 +208,7 @@ function draw() {
     ctx.fillRect(hpX, hpY, hpW * (e.hp / e.maxHp), 4);
   }
 
+  // другие игроки
   for (const p of net.players.values()) {
     if (p.id === myPlayer.id) continue;
     const sx = p.x + ox, sy = p.y + oy;
@@ -188,6 +217,7 @@ function draw() {
     ctx.strokeStyle = '#5dade2'; ctx.lineWidth = 2; ctx.stroke();
   }
 
+  // я
   {
     const sx = myPlayer.x + ox, sy = myPlayer.y + oy;
     ctx.fillStyle = '#2ecc71';
@@ -195,12 +225,14 @@ function draw() {
     ctx.strokeStyle = '#58d68d'; ctx.lineWidth = 2; ctx.stroke();
   }
 
+  // снаряды
   for (const pr of net.projectiles.values()) {
     const sx = pr.x + ox, sy = pr.y + oy;
     ctx.fillStyle = '#f1c40f';
     ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
   }
 
+  // прицел
   if (input.mouse.x || input.mouse.y) {
     ctx.strokeStyle = 'rgba(241,196,15,0.85)'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.arc(input.mouse.x, input.mouse.y, 8, 0, Math.PI * 2); ctx.stroke();

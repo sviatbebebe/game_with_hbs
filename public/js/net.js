@@ -59,6 +59,11 @@ export class Net {
       this.players.set(msg.player.id, msg.player);
     } else if (msg.type === 'leave') {
       this.players.delete(msg.id);
+    } else if (msg.type === 'tileChange') {
+      if (this.map && this.map.tiles[msg.ty]) {
+        this.map.tiles[msg.ty][msg.tx] = msg.tile;
+      }
+      this.emit('tileChange', msg);
     } else if (msg.type === 'state') {
       this.gameState = 'playing';
       const seen = new Set();
@@ -84,4 +89,5 @@ export class Net {
   backToLobby() { this._send({ type: 'backToLobby' }); }
   sendMove(dx, dy) { this._send({ type: 'move', dx, dy }); }
   sendAttack(angle) { this._send({ type: 'attack', angle }); }
+  sendMelee(angle) { this._send({ type: 'melee', angle }); }
 }

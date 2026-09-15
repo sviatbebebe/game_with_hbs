@@ -10,26 +10,93 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 3000;
 const TILE = 32;
-const MAP_W = 60;
-const MAP_H = 45;
 
-// ---------- карта ----------
-const map = [];
-for (let y = 0; y < MAP_H; y++) {
-  const row = [];
-  for (let x = 0; x < MAP_W; x++) {
-    const border = x === 0 || y === 0 || x === MAP_W - 1 || y === MAP_H - 1;
-    const block = x % 10 === 0 && y % 10 === 0 && x > 0 && y > 0 && x < MAP_W - 1 && y < MAP_H - 1;
-    row.push(border || block ? 1 : 0);
-  }
-  map.push(row);
-}
+// Карта в 10 раз больше: 200x150 = 30 000 тайлов
+const MAP_W = 200;
+const MAP_H = 150;
+
+// Типы поверхности
+const T_GRASS = 0;   // трава, ходим
+const T_STONE = 1;   // каменная стена, ломается, блокирует движение и снаряды
+const T_WATER = 2;   // вода, блокирует движение, снаряды пролетают
+const T_FLOOR = 3;   // каменный пол, ходим
+
 function isSolid(x, y) {
   const tx = Math.floor(x / TILE);
   const ty = Math.floor(y / TILE);
   if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
-  return map[ty][tx] === 1;
+  const t = map[ty][tx];
+  return t === T_STONE || t === T_WATER;
 }
+
+function blocksProjectile(x, y) {
+  const tx = Math.floor(x / TILE);
+  const ty = Math.floor(y / TILE);
+  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
+  return map[ty][tx] === T_STONE;
+}
+
+// ---------- генерация карты ----------
+const map = [];
+for (let y = 0; y < MAP_H; y++) {
+  const row = [];
+  for (let x = 0; x < MAP_W; x++) row.push(T_GRASS);
+  map.push(row);
+}
+
+// границы — стены
+for (let x = 0; x < MAP_W; x++) { map[0][x] = T_STONE; map[MAP_H - 1][x] = T_STONE; }
+for (let y = 0; y < MAP_H; y++) { map[y][0] = T_STONE; map[y][MAP_W - 1] = T_STONE; }
+
+// пруды воды
+for (let i = 0; i < 30; i++) {
+  const cx = 5 + Math.floor(Math.random() * (MAP_W - 10));
+  const cy = 5 + Math.floor(Math.random() * (MAP_H - 10));
+  const r = 4 + Math.floor(Math.random() * 6);
+  for (let y = cy - r; y <= cy + r; y++) {
+    for (let x = cx - r; x <= cx + r; x++) {
+      if (x < 1 || y < 1 || x >= MAP_W - 1 || y >= MAP_H - 1) continue;
+      const d = Math.hypot(x - cx, y - cy);
+      if (d < r - Math.random() * 1.5) map[y][x] = T_WATER;
+    }
+  }
+}
+
+// каменные площадки
+for (let i = 0; i < 40; i++) {
+  const cx = 5 + Math.floor(Math.random() * (MAP_W - 10));
+  const cy = 5 + Math.floor(Math.random() * (MAP_H - 10));
+  const r = 3 + Math.floor(Math.random() * 5);
+  for (let y = cy - r; y <= cy + r; y++) {
+    for (let x = cx - r; x <= cx + r; x++) {
+      if (x < 1 || y < 1 || x >= MAP_W - 1 || y >= MAP_H - 1) continue;
+      if (map[y][x] !== T_GRASS) continue;
+      const d = Math.hypot(x - cx, y - cy);
+      if (d < r - Math.random() * 1.2) map[y][x] = T_FLOOR;
+    }
+  }
+}
+
+// каменные стены (кластеры, ломаются)
+for (let i = 0; i < 200; i++) {
+  const cx = 2 + Math.floor(Math.random() * (MAP_W - 4));
+  const cy = 2 + Math.floor(Math.random() * (MAP_H - 4));
+  const size = 2 + Math.floor(Math.random() * 6);
+  let x = cx, y = cy;
+  for (let j = 0; j < size; j++) {
+    if (x > 0 && y > 0 && x < MAP_W - 1 && y < MAP_H - 1) {
+      if (map[y][x] === T_GRASS || map[y][x] === T_FLOOR) {
+        map[y][x] = T_STONE;
+      }
+    }
+    x += Math.floor(Math.random() * 3) - 1;
+    y += Math.floor(Math.random() * 3) - 1;
+  }
+}
+
+// HP стен (только для тех, что уже повреждены)
+const wallHP = new Map();
+const WALL_HP = 50;
 
 // ---------- статика ----------
 const MIME = {
@@ -77,21 +144,30 @@ const ENEMY_AGGRO = 350;
 const ENEMY_CHASE_SPEED = 90;
 const ENEMY_WANDER_SPEED = 35;
 const ENEMY_HOME_LEASH = 80;
+const ENEMY_AGGRO_MEMORY = 6000;   // мс — сколько помнит, что в него попали
 
-const GROUP_MIN = 3, GROUP_MAX = 5;
-const GROUP_SIZE_MIN = 3, GROUP_SIZE_MAX = 5;
+const GROUP_MIN = 4, GROUP_MAX = 8;
+const GROUP_SIZE_MIN = 3, GROUP_SIZE_MAX = 6;
 const GROUP_SPAWN_DIST = 400;
 
 const PROJ_SPEED = 500;
 const PROJ_RADIUS = 5;
 const PROJ_DAMAGE = 10;
 const PROJ_TTL = 1.5;
+const PROJ_MAX_DIST = 400;         // ограничение дальности полёта снаряда
+
+const MELEE_RANGE = 60;
+const MELEE_DAMAGE = 25;
+const MELEE_CD = 300;              // мс
+const playerMeleeLast = new Map();
 
 function findSpawn() {
-  for (let i = 0; i < 300; i++) {
-    const x = (5 + Math.random() * (MAP_W - 10)) * TILE;
-    const y = (5 + Math.random() * (MAP_H - 10)) * TILE;
-    if (!isSolid(x, y)) return { x, y };
+  for (let i = 0; i < 500; i++) {
+    const tx = 2 + Math.floor(Math.random() * (MAP_W - 4));
+    const ty = 2 + Math.floor(Math.random() * (MAP_H - 4));
+    if (map[ty][tx] === T_GRASS || map[ty][tx] === T_FLOOR) {
+      return { x: tx * TILE + TILE / 2, y: ty * TILE + TILE / 2 };
+    }
   }
   return { x: TILE * 2, y: TILE * 2 };
 }
@@ -114,10 +190,12 @@ function broadcastLobby() { broadcast(lobbyState()); }
 
 // ---------- спавн врагов группами ----------
 function spawnEnemyGroup() {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    const cx = (5 + Math.random() * (MAP_W - 10)) * TILE;
-    const cy = (5 + Math.random() * (MAP_H - 10)) * TILE;
-    if (isSolid(cx, cy)) continue;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const tx = 3 + Math.floor(Math.random() * (MAP_W - 6));
+    const ty = 3 + Math.floor(Math.random() * (MAP_H - 6));
+    if (map[ty][tx] !== T_GRASS && map[ty][tx] !== T_FLOOR) continue;
+    const cx = tx * TILE + TILE / 2;
+    const cy = ty * TILE + TILE / 2;
 
     let tooClose = false;
     for (const p of players.values()) {
@@ -126,9 +204,10 @@ function spawnEnemyGroup() {
     if (tooClose) continue;
 
     const size = GROUP_SIZE_MIN + Math.floor(Math.random() * (GROUP_SIZE_MAX - GROUP_SIZE_MIN + 1));
-    for (let i = 0; i < size; i++) {
+    let placed = 0;
+    for (let i = 0; i < size * 3 && placed < size; i++) {
       const ang = Math.random() * Math.PI * 2;
-      const rad = 20 + Math.random() * 60;
+      const rad = 20 + Math.random() * 80;
       const ex = cx + Math.cos(ang) * rad;
       const ey = cy + Math.sin(ang) * rad;
       if (isSolid(ex, ey)) continue;
@@ -140,9 +219,11 @@ function spawnEnemyGroup() {
         speed: ENEMY_CHASE_SPEED,
         lastHit: 0,
         homeX: ex, homeY: ey,
+        aggroUntil: 0,
       });
+      placed++;
     }
-    return true;
+    if (placed > 0) return true;
   }
   return false;
 }
@@ -187,6 +268,37 @@ function startGame() {
     enemies: [...enemies.values()],
     projectiles: [...projectiles.values()],
   });
+}
+
+// ---------- механика удара по стене ----------
+function meleeStrike(p, angle) {
+  const now = Date.now();
+  const last = playerMeleeLast.get(p.id) || 0;
+  if (now - last < MELEE_CD) return;
+  playerMeleeLast.set(p.id, now);
+
+  const step = 8;
+  for (let d = 0; d <= MELEE_RANGE; d += step) {
+    const wx = p.x + Math.cos(angle) * d;
+    const wy = p.y + Math.sin(angle) * d;
+    const tx = Math.floor(wx / TILE);
+    const ty = Math.floor(wy / TILE);
+    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return;
+    if (map[ty][tx] !== T_STONE) continue;
+
+    const key = tx + ',' + ty;
+    const cur = wallHP.has(key) ? wallHP.get(key) : WALL_HP;
+    const next = cur - MELEE_DAMAGE;
+    if (next <= 0) {
+      map[ty][tx] = T_FLOOR;
+      wallHP.delete(key);
+      broadcast({ type: 'tileChange', tx, ty, tile: T_FLOOR });
+    } else {
+      wallHP.set(key, next);
+      broadcast({ type: 'tileChange', tx, ty, tile: T_STONE, hp: next });
+    }
+    return;
+  }
 }
 
 // ---------- подключения ----------
@@ -255,23 +367,27 @@ wss.on('connection', (ws) => {
       if (gameState !== 'playing') return;
       const a = Number(msg.angle) || 0;
       const pid = nextProjectileId++;
+      const sx = p.x + Math.cos(a) * (p.radius + 4);
+      const sy = p.y + Math.sin(a) * (p.radius + 4);
       projectiles.set(pid, {
-        id: pid,
-        x: p.x + Math.cos(a) * (p.radius + 4),
-        y: p.y + Math.sin(a) * (p.radius + 4),
+        id: pid, x: sx, y: sy,
+        startX: sx, startY: sy,
         vx: Math.cos(a) * PROJ_SPEED,
         vy: Math.sin(a) * PROJ_SPEED,
         ownerId: id, ttl: PROJ_TTL,
+        maxDist: PROJ_MAX_DIST,
       });
+    } else if (msg.type === 'melee') {
+      if (gameState !== 'playing') return;
+      meleeStrike(p, Number(msg.angle) || 0);
     }
   });
 
   ws.on('close', () => {
     players.delete(id);
     readySet.delete(id);
-    if (id === hostId) {
-      hostId = players.size ? [...players.keys()][0] : null;
-    }
+    playerMeleeLast.delete(id);
+    if (id === hostId) hostId = players.size ? [...players.keys()][0] : null;
     if (players.size === 0 && gameState === 'playing') {
       gameState = 'lobby';
       enemies.clear();
@@ -294,10 +410,13 @@ function movePlayer(p, dt) {
 
 function updateEnemies(dt, now) {
   for (const e of enemies.values()) {
+    const aggroMemory = now < (e.aggroUntil || 0);
     let target = null, minD = Infinity;
     for (const p of players.values()) {
       const d = Math.hypot(p.x - e.x, p.y - e.y);
-      if (d < ENEMY_AGGRO && d < minD) { minD = d; target = p; }
+      if ((aggroMemory || d < ENEMY_AGGRO) && d < minD) {
+        minD = d; target = p;
+      }
     }
 
     if (!target) {
@@ -334,16 +453,27 @@ function updateEnemies(dt, now) {
   }
 }
 
-function updateProjectiles(dt) {
+function updateProjectiles(dt, now) {
   for (const [id, pr] of projectiles) {
-    pr.x += pr.vx * dt; pr.y += pr.vy * dt; pr.ttl -= dt;
-    if (pr.ttl <= 0 || isSolid(pr.x, pr.y)) { projectiles.delete(id); continue; }
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
+    pr.ttl -= dt;
+
+    const traveled = Math.hypot(pr.x - pr.startX, pr.y - pr.startY);
+    if (pr.ttl <= 0 || traveled >= pr.maxDist || blocksProjectile(pr.x, pr.y)) {
+      projectiles.delete(id);
+      continue;
+    }
+
     let hit = false;
     for (const e of enemies.values()) {
       if (Math.hypot(pr.x - e.x, pr.y - e.y) < e.radius + PROJ_RADIUS) {
         e.hp -= PROJ_DAMAGE;
+        // агрессия по попаданию
+        e.aggroUntil = now + ENEMY_AGGRO_MEMORY;
         if (e.hp <= 0) enemies.delete(e.id);
-        hit = true; break;
+        hit = true;
+        break;
       }
     }
     if (hit) projectiles.delete(id);
@@ -359,7 +489,7 @@ setInterval(() => {
   if (gameState !== 'playing') return;
   for (const p of players.values()) movePlayer(p, dt);
   updateEnemies(dt, now);
-  updateProjectiles(dt);
+  updateProjectiles(dt, now);
 
   broadcast({
     type: 'state',
