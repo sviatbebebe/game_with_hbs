@@ -1,25 +1,26 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8">
-  <title>Co-op RPG</title>
-  <link rel="stylesheet" href="style.css">
+<meta charset="utf-8">
+<title>game_with_hbs</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #111; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; color: #eee;
+    font-family: monospace; font-size: 14px; pointer-events: none;
+    text-shadow: 0 1px 2px #000;
+  }
+  #hint {
+    position: fixed; bottom: 10px; left: 10px; color: #888;
+    font-family: monospace; font-size: 12px; pointer-events: none;
+  }
+</style>
 </head>
 <body>
-  <canvas id="game" width="960" height="640"></canvas>
-
-  <div id="menu">
-    <h1>Co-op RPG</h1>
-    <input id="name" placeholder="Твоё имя" maxlength="12" value="Player">
-
-    <label for="hostIp" class="label">IP хоста (Radmin)</label>
-    <input id="hostIp" placeholder="оставь пустым, если ты хост">
-
-    <button id="playBtn">Подключиться</button>
-    <p id="status"></p>
-    <p id="selfHint" class="hint"></p>
-  </div>
-
-  <script type="module" src="js/main.js"></script>
+<canvas id="game"></canvas>
+<div id="hud"></div>
+<div id="hint">WASD — движение, ЛКМ — атака в сторону курсора</div>
+<script type="module" src="/js/main.js"></script>
 </body>
 </html>

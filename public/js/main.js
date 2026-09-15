@@ -1,149 +1,157 @@
-import { Input }  from './input.js';
-import { Camera } from './camera.js';
-import { World }  from './world.js';
-import { Player } from './player.js';
-import { Net }    from './net.js';
+import { Net } from './net.js';
+import { Input } from './input.js';
 
 const canvas = document.getElementById('game');
-const ctx    = canvas.getContext('2d');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
 
-const input  = new Input();
-const world  = new World();
-const camera = new Camera(canvas.width, canvas.height);
-const net    = new Net();
+const TILE = 32;
+const CAM_LERP = 0.15;
 
-let player = null;
-let playing = false;
-let sendTimer = 0;
+const net = new Net();
+const input = new Input();
 
-// ---------- меню ----------
-const menu    = document.getElementById('menu');
-const nameIn  = document.getElementById('name');
-const hostIp  = document.getElementById('hostIp');
-const playBtn = document.getElementById('playBtn');
-const status  = document.getElementById('status');
-const hint    = document.getElementById('selfHint');
+const camera = { x: 0, y: 0 };
+let mapData = null;
+let myPlayer = null;
+let camInit = false;
 
-// подсказки по ситуации
-if (location.protocol === 'file:') {
-  hostIp.placeholder = 'введи Radmin-IP хоста';
-  hint.textContent = 'Файл открыт локально — нужен IP хоста.';
-} else if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-  hint.textContent = 'Ты на localhost — оставь поле пустым (ты хост).';
-} else {
-  hostIp.value = location.hostname;   // друг открыл через Radmin-IP
-  hint.textContent = 'Поле уже заполнено — просто нажми «Подключиться».';
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
 }
+window.addEventListener('resize', resize);
+resize();
 
-playBtn.onclick = async () => {
-  playBtn.disabled = true;
-  status.textContent = 'Подключаемся…';
+window.addEventListener('mousemove', (e) => {
+  input.mouse.x = e.clientX;
+  input.mouse.y = e.clientY;
+});
 
-  const name = nameIn.value.trim() || 'Player';
-  const ip   = hostIp.value.trim();
+window.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (!myPlayer) return;
+  const wx = e.clientX + camera.x;
+  const wy = e.clientY + camera.y;
+  const angle = Math.atan2(wy - myPlayer.y, wx - myPlayer.x);
+  net.sendAttack(angle);
+});
 
-  let url;
-  if (!ip) {
-    // пусто → подключаемся к тому же хосту, откуда открыта страница
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    url = `${proto}://${location.host}`;
-  } else {
-    url = `ws://${ip}:3000`;
-  }
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+net.connect(`${wsProto}//${location.host}`).then(() => {
+  mapData = net.map;
+});
 
-  net.onDisconnect = () => {
-    status.textContent = 'Соединение потеряно';
-    playBtn.disabled = false;
-    playing = false;
-    menu.hidden = false;
-  };
+setInterval(() => {
+  const { dx, dy } = input.getMove();
+  net.sendMove(dx, dy);
+}, 50);
 
-  net.onInit = () => {
-    const me = net.players.get(net.id);
-    player = new Player(me.x, me.y);
-    camera.follow(player);
-    playing = true;
-    menu.hidden = true;
-  };
+function draw() {
+  requestAnimationFrame(draw);
 
-  try {
-    await net.connect(url, name);
-  } catch (e) {
-    status.textContent = 'Ошибка: ' + e.message;
-    playBtn.disabled = false;
-  }
-};
-
-// ---------- апдейт ----------
-function update(dt) {
-  if (!playing || !player) return;
-
-  player.update(dt, input, world);
-  camera.follow(player);
-
-  sendTimer += dt;
-  if (sendTimer >= 0.05) {
-    sendTimer = 0;
-    net.sendState(player.x, player.y);
-  }
-
-  for (const p of net.players.values()) {
-    if (p.id === net.id) continue;
-    p.x += (p.tx - p.x) * 0.25;
-    p.y += (p.ty - p.y) * 0.25;
-  }
-}
-
-// ---------- рендер ----------
-function drawPlayer(x, y, name, hue, isSelf) {
-  const s = camera.toScreen(x, y);
-
-  ctx.fillStyle = `hsl(${hue} 65% ${isSelf ? 60 : 50}%)`;
-  ctx.beginPath();
-  ctx.arc(s.x, s.y, 12, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.strokeStyle = isSelf ? '#fff' : 'rgba(0,0,0,0.6)';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  ctx.font = '12px system-ui';
-  ctx.textAlign = 'center';
-  ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillText(name, s.x + 1, s.y - 17);
-  ctx.fillStyle = '#fff';
-  ctx.fillText(name, s.x, s.y - 18);
-}
-
-function render() {
   ctx.fillStyle = '#111';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  world.render(ctx, camera);
+  myPlayer = net.getSelf();
+  if (!myPlayer || !mapData) return;
+
+  const targetCamX = myPlayer.x - canvas.width / 2;
+  const targetCamY = myPlayer.y - canvas.height / 2;
+  if (!camInit) {
+    camera.x = targetCamX; camera.y = targetCamY; camInit = true;
+  } else {
+    camera.x += (targetCamX - camera.x) * CAM_LERP;
+    camera.y += (targetCamY - camera.y) * CAM_LERP;
+  }
+
+  const ox = -camera.x;
+  const oy = -camera.y;
+
+  const tiles = mapData.tiles;
+  const x0 = Math.max(0, Math.floor(camera.x / TILE));
+  const y0 = Math.max(0, Math.floor(camera.y / TILE));
+  const x1 = Math.min(mapData.w, Math.ceil((camera.x + canvas.width) / TILE));
+  const y1 = Math.min(mapData.h, Math.ceil((camera.y + canvas.height) / TILE));
+
+  for (let ty = y0; ty < y1; ty++) {
+    for (let tx = x0; tx < x1; tx++) {
+      const isWall = tiles[ty][tx] === 1;
+      ctx.fillStyle = isWall ? '#333' : '#1e1e1e';
+      ctx.fillRect(tx * TILE + ox, ty * TILE + oy, TILE, TILE);
+      if (!isWall) {
+        ctx.strokeStyle = '#262626';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(tx * TILE + ox + 0.5, ty * TILE + oy + 0.5, TILE - 1, TILE - 1);
+      }
+    }
+  }
+
+  for (const e of net.enemies.values()) {
+    const sx = e.x + ox, sy = e.y + oy;
+    ctx.fillStyle = '#c0392b';
+    ctx.beginPath();
+    ctx.arc(sx, sy, e.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#e74c3c';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    const hpW = 30;
+    const hpX = sx - hpW / 2;
+    const hpY = sy - e.radius - 8;
+    ctx.fillStyle = '#222';
+    ctx.fillRect(hpX, hpY, hpW, 4);
+    ctx.fillStyle = '#e74c3c';
+    ctx.fillRect(hpX, hpY, hpW * (e.hp / e.maxHp), 4);
+  }
 
   for (const p of net.players.values()) {
-    if (p.id === net.id) continue;
-    drawPlayer(p.x, p.y, p.name, p.hue, false);
+    if (p.id === myPlayer.id) continue;
+    const sx = p.x + ox, sy = p.y + oy;
+    ctx.fillStyle = '#3498db';
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#5dade2';
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 
-  if (player) {
-    const me = net.players.get(net.id);
-    drawPlayer(player.x, player.y, me.name, me.hue, true);
+  {
+    const sx = myPlayer.x + ox;
+    const sy = myPlayer.y + oy;
+    ctx.fillStyle = '#2ecc71';
+    ctx.beginPath();
+    ctx.arc(sx, sy, myPlayer.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#58d68d';
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 
-  ctx.font = '14px monospace';
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#aaa';
-  ctx.fillText(`игроков: ${net.players.size}`, 10, 22);
-}
+  for (const pr of net.projectiles.values()) {
+    const sx = pr.x + ox, sy = pr.y + oy;
+    ctx.fillStyle = '#f1c40f';
+    ctx.beginPath();
+    ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
 
-// ---------- цикл ----------
-let last = performance.now();
-function loop(now) {
-  const dt = Math.min((now - last) / 1000, 0.05);
-  last = now;
-  update(dt);
-  render();
-  requestAnimationFrame(loop);
+  if (input.mouse.x || input.mouse.y) {
+    ctx.strokeStyle = 'rgba(241,196,15,0.85)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(input.mouse.x, input.mouse.y, 8, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(input.mouse.x - 12, input.mouse.y);
+    ctx.lineTo(input.mouse.x + 12, input.mouse.y);
+    ctx.moveTo(input.mouse.x, input.mouse.y - 12);
+    ctx.lineTo(input.mouse.x, input.mouse.y + 12);
+    ctx.stroke();
+  }
+
+  hud.textContent = `HP: ${Math.max(0, Math.round(myPlayer.hp))}/${myPlayer.maxHp}   Врагов: ${net.enemies.size}`;
 }
-requestAnimationFrame(loop);
+draw();

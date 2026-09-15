@@ -1,560 +1,632 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-create_radmin_rpg.py
+replace_files.py — заменяет файлы игры на новые версии.
 
-Создаёт полный проект кооп-RPG через Radmin-IP + WebSocket с нуля:
+Запуск из корня проекта (там, где server.js и package.json):
+    python replace_files.py            # применить
+    python replace_files.py --revert   # откатить из .bak
+    python replace_files.py --dry-run  # только показать, что будет записано
 
-    package.json
-    server.js
-    public/
-      index.html
-      style.css
-      js/
-        main.js
-        input.js
-        camera.js
-        world.js
-        player.js
-        net.js
-
-Запуск:
-    python create_radmin_rpg.py
-
-Скрипт создаёт все папки и файлы в текущей директории.
-Существующие файлы будут перезаписаны.
+Старые файлы сохраняются рядом как <имя>.bak (один раз).
 """
 
+import argparse
+import shutil
+import sys
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Содержимое новых файлов
+# ---------------------------------------------------------------------------
 
 FILES = {}
 
-# ----------------------------------------------------------------- package.json
-FILES["package.json"] = """{
-  "name": "rpg-radmin",
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.18.0" }
+FILES["server.js"] = r'''const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const WebSocket = require('ws');
+
+const PORT = process.env.PORT || 3000;
+const TILE = 32;
+const MAP_W = 60;
+const MAP_H = 45;
+
+// карта: 0 — пол, 1 — стена
+const map = [];
+for (let y = 0; y < MAP_H; y++) {
+  const row = [];
+  for (let x = 0; x < MAP_W; x++) {
+    const border = x === 0 || y === 0 || x === MAP_W - 1 || y === MAP_H - 1;
+    const block = x % 10 === 0 && y % 10 === 0 && x > 0 && y > 0 && x < MAP_W - 1 && y < MAP_H - 1;
+    row.push(border || block ? 1 : 0);
+  }
+  map.push(row);
 }
-"""
 
-# ------------------------------------------------------------------- server.js
-FILES["server.js"] = """import { WebSocketServer } from 'ws';
-import http from 'http';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
-import { fileURLToPath } from 'url';
+function isSolid(x, y) {
+  const tx = Math.floor(x / TILE);
+  const ty = Math.floor(y / TILE);
+  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
+  return map[ty][tx] === 1;
+}
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 3000;
-const PUBLIC = path.join(__dirname, 'public');
-const MIME = { '.html':'text/html', '.js':'text/javascript', '.css':'text/css', '.png':'image/png' };
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png',
+  '.json': 'application/json; charset=utf-8',
+};
 
-// ---------- статика ----------
-const httpServer = http.createServer((req, res) => {
-  let urlPath = req.url.split('?')[0];
+const server = http.createServer((req, res) => {
+  let urlPath = decodeURIComponent(req.url.split('?')[0]);
   if (urlPath === '/') urlPath = '/index.html';
-  const filePath = path.join(PUBLIC, urlPath);
-  if (!filePath.startsWith(PUBLIC)) { res.writeHead(403); res.end(); return; }
+  const root = path.join(__dirname, 'public');
+  const filePath = path.join(root, urlPath);
+  if (!filePath.startsWith(root)) {
+    res.writeHead(403); res.end('forbidden'); return;
+  }
   fs.readFile(filePath, (err, data) => {
-    if (err) { res.writeHead(404); res.end('Not found'); return; }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream' });
+    if (err) { res.writeHead(404); res.end('not found'); return; }
+    const ext = path.extname(filePath);
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
     res.end(data);
   });
 });
 
-// ---------- WebSocket ----------
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocket.Server({ server });
+
 const players = new Map();
-let nextId = 1;
+const enemies = new Map();
+const projectiles = new Map();
+let nextPlayerId = 1;
+let nextEnemyId = 1;
+let nextProjectileId = 1;
 
-const TILE = 32;
-const SPAWNS = [
-  { x: TILE*4, y: TILE*4 },
-  { x: TILE*6, y: TILE*4 },
-  { x: TILE*4, y: TILE*6 },
-  { x: TILE*6, y: TILE*6 },
-];
+const PLAYER_RADIUS = 14;
+const PLAYER_SPEED = 180;
+const PLAYER_HP = 100;
 
-function broadcast(obj, exceptId = null) {
-  const data = JSON.stringify(obj);
-  for (const ws of wss.clients) {
-    if (ws.readyState !== 1 || ws.playerId === exceptId) continue;
-    ws.send(data);
+const ENEMY_SPEED = 70;
+const ENEMY_HP = 30;
+const ENEMY_RADIUS = 14;
+const ENEMY_DAMAGE = 10;
+const ENEMY_ATTACK_CD = 1.0;
+
+const PROJ_SPEED = 500;
+const PROJ_RADIUS = 5;
+const PROJ_DAMAGE = 10;
+const PROJ_TTL = 1.5;
+
+function findSpawn() {
+  for (let i = 0; i < 300; i++) {
+    const x = (5 + Math.random() * (MAP_W - 10)) * TILE;
+    const y = (5 + Math.random() * (MAP_H - 10)) * TILE;
+    if (!isSolid(x, y)) return { x, y };
+  }
+  return { x: TILE * 2, y: TILE * 2 };
+}
+
+function spawnEnemy() {
+  for (let i = 0; i < 100; i++) {
+    const x = (5 + Math.random() * (MAP_W - 10)) * TILE;
+    const y = (5 + Math.random() * (MAP_H - 10)) * TILE;
+    if (isSolid(x, y)) continue;
+    let tooClose = false;
+    for (const p of players.values()) {
+      if (Math.hypot(p.x - x, p.y - y) < 250) { tooClose = true; break; }
+    }
+    if (tooClose) continue;
+    const id = nextEnemyId++;
+    enemies.set(id, {
+      id, x, y,
+      hp: ENEMY_HP, maxHp: ENEMY_HP,
+      radius: ENEMY_RADIUS,
+      speed: ENEMY_SPEED,
+      lastHit: 0,
+    });
+    return;
   }
 }
 
-wss.on('connection', ws => {
-  const id = nextId++;
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  for (const ws of wss.clients) {
+    if (ws.readyState === 1) ws.send(data);
+  }
+}
+
+wss.on('connection', (ws) => {
+  const id = nextPlayerId++;
+  const spawn = findSpawn();
+  const player = {
+    id,
+    x: spawn.x, y: spawn.y,
+    radius: PLAYER_RADIUS,
+    hp: PLAYER_HP, maxHp: PLAYER_HP,
+    dirX: 0, dirY: 0,
+  };
+  players.set(id, player);
   ws.playerId = id;
 
-  ws.on('message', raw => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
+  ws.send(JSON.stringify({
+    type: 'init',
+    id,
+    map: { tiles: map, tile: TILE, w: MAP_W, h: MAP_H },
+    players: [...players.values()],
+    enemies: [...enemies.values()],
+    projectiles: [...projectiles.values()],
+  }));
 
-    if (msg.type === 'join') {
-      const sp = SPAWNS[(id - 1) % SPAWNS.length];
-      const player = {
-        id,
-        name: String(msg.name || 'Player').slice(0, 12),
-        x: sp.x, y: sp.y,
-        hue: (id * 137) % 360,
-      };
-      players.set(id, player);
-      console.log(`+ ${player.name} (id=${id}) — всего ${players.size}`);
+  broadcast({ type: 'join', player });
 
-      ws.send(JSON.stringify({ type: 'init', id, players: [...players.values()] }));
-      broadcast({ type: 'join', player }, id);
-    }
-    else if (msg.type === 'state') {
-      const p = players.get(id);
-      if (p) { p.x = msg.x; p.y = msg.y; }
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    const p = players.get(id);
+    if (!p) return;
+    if (msg.type === 'move') {
+      p.dirX = Number(msg.dx) || 0;
+      p.dirY = Number(msg.dy) || 0;
+    } else if (msg.type === 'attack') {
+      const a = Number(msg.angle) || 0;
+      const pid = nextProjectileId++;
+      projectiles.set(pid, {
+        id: pid,
+        x: p.x + Math.cos(a) * (p.radius + 4),
+        y: p.y + Math.sin(a) * (p.radius + 4),
+        vx: Math.cos(a) * PROJ_SPEED,
+        vy: Math.sin(a) * PROJ_SPEED,
+        ownerId: id,
+        ttl: PROJ_TTL,
+      });
     }
   });
 
   ws.on('close', () => {
-    const p = players.get(id);
-    if (!p) return;
     players.delete(id);
     broadcast({ type: 'leave', id });
-    console.log(`- ${p.name} вышел — всего ${players.size}`);
   });
 });
 
-// рассылка 20 раз в секунду
+function movePlayer(p, dt) {
+  const len = Math.hypot(p.dirX, p.dirY) || 1;
+  const nx = (p.dirX / len) * PLAYER_SPEED * dt;
+  const ny = (p.dirY / len) * PLAYER_SPEED * dt;
+  const newX = p.x + nx;
+  const newY = p.y + ny;
+  if (!isSolid(newX, p.y)) p.x = newX;
+  if (!isSolid(p.x, newY)) p.y = newY;
+}
+
+function updateEnemies(dt, now) {
+  for (const e of enemies.values()) {
+    let nearest = null, minD = Infinity;
+    for (const p of players.values()) {
+      const d = Math.hypot(p.x - e.x, p.y - e.y);
+      if (d < minD) { minD = d; nearest = p; }
+    }
+    if (!nearest) continue;
+
+    if (minD < e.radius + nearest.radius + 4) {
+      if (now - e.lastHit > ENEMY_ATTACK_CD * 1000) {
+        nearest.hp -= ENEMY_DAMAGE;
+        e.lastHit = now;
+        if (nearest.hp <= 0) {
+          const sp = findSpawn();
+          nearest.x = sp.x; nearest.y = sp.y;
+          nearest.hp = nearest.maxHp;
+        }
+      }
+      continue;
+    }
+    const dx = nearest.x - e.x, dy = nearest.y - e.y;
+    const l = Math.hypot(dx, dy) || 1;
+    const nx = e.x + (dx / l) * e.speed * dt;
+    const ny = e.y + (dy / l) * e.speed * dt;
+    if (!isSolid(nx, e.y)) e.x = nx;
+    if (!isSolid(e.x, ny)) e.y = ny;
+  }
+}
+
+function updateProjectiles(dt) {
+  for (const [id, pr] of projectiles) {
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
+    pr.ttl -= dt;
+    if (pr.ttl <= 0 || isSolid(pr.x, pr.y)) { projectiles.delete(id); continue; }
+    let hit = false;
+    for (const e of enemies.values()) {
+      if (Math.hypot(pr.x - e.x, pr.y - e.y) < e.radius + PROJ_RADIUS) {
+        e.hp -= PROJ_DAMAGE;
+        if (e.hp <= 0) enemies.delete(e.id);
+        hit = true;
+        break;
+      }
+    }
+    if (hit) projectiles.delete(id);
+  }
+}
+
+let lastTick = Date.now();
 setInterval(() => {
-  if (!players.size) return;
-  broadcast({ type: 'state', players: [...players.values()] });
+  const now = Date.now();
+  const dt = Math.min((now - lastTick) / 1000, 0.1);
+  lastTick = now;
+
+  for (const p of players.values()) movePlayer(p, dt);
+  updateEnemies(dt, now);
+  updateProjectiles(dt);
+
+  broadcast({
+    type: 'state',
+    players: [...players.values()],
+    enemies: [...enemies.values()],
+    projectiles: [...projectiles.values()],
+  });
 }, 50);
 
-// ---------- запуск ----------
-httpServer.listen(PORT, '0.0.0.0', () => {
-  const ips = [];
-  for (const iface of Object.values(os.networkInterfaces())) {
-    for (const info of iface) {
-      if (info.family === 'IPv4' && !info.internal) ips.push(info.address);
-    }
-  }
-  console.log('=== Server running ===');
-  console.log(`  local:  http://localhost:${PORT}`);
-  for (const ip of ips) {
-    const tag = ip.startsWith('26.') ? ' ← Radmin (этот дай другу)' : '';
-    console.log(`  LAN:    http://${ip}:${PORT}${tag}`);
-  }
-});
-"""
+setInterval(() => {
+  if (players.size > 0 && enemies.size < 8) spawnEnemy();
+}, 2500);
 
-# ------------------------------------------------------------ public/index.html
-FILES["public/index.html"] = """<!DOCTYPE html>
+server.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});
+'''
+
+FILES["public/index.html"] = r'''<!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8">
-  <title>Co-op RPG</title>
-  <link rel="stylesheet" href="style.css">
+<meta charset="utf-8">
+<title>game_with_hbs</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #111; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 10px; left: 10px; color: #eee;
+    font-family: monospace; font-size: 14px; pointer-events: none;
+    text-shadow: 0 1px 2px #000;
+  }
+  #hint {
+    position: fixed; bottom: 10px; left: 10px; color: #888;
+    font-family: monospace; font-size: 12px; pointer-events: none;
+  }
+</style>
 </head>
 <body>
-  <canvas id="game" width="960" height="640"></canvas>
-
-  <div id="menu">
-    <h1>Co-op RPG</h1>
-    <input id="name" placeholder="Твоё имя" maxlength="12" value="Player">
-
-    <label for="hostIp" class="label">IP хоста (Radmin)</label>
-    <input id="hostIp" placeholder="оставь пустым, если ты хост">
-
-    <button id="playBtn">Подключиться</button>
-    <p id="status"></p>
-    <p id="selfHint" class="hint"></p>
-  </div>
-
-  <script type="module" src="js/main.js"></script>
+<canvas id="game"></canvas>
+<div id="hud"></div>
+<div id="hint">WASD — движение, ЛКМ — атака в сторону курсора</div>
+<script type="module" src="/js/main.js"></script>
 </body>
 </html>
-"""
+'''
 
-# ------------------------------------------------------------ public/style.css
-FILES["public/style.css"] = """* { box-sizing: border-box; }
-body {
-  margin: 0; background: #0a0a0a; color: #ddd;
-  font: 14px/1.4 system-ui, sans-serif;
-  display: flex; align-items: center; justify-content: center;
-  height: 100vh;
-}
-canvas { image-rendering: pixelated; border: 2px solid #333; }
-
-#menu {
-  position: fixed; inset: 0;
-  background: rgba(10,10,10,0.96);
-  display: flex; flex-direction: column;
-  align-items: center; justify-content: center;
-  gap: 10px; padding: 20px; text-align: center;
-}
-#menu[hidden] { display: none; }
-#menu h1 { margin: 0 0 12px; font-weight: 300; letter-spacing: 4px; }
-#menu input, #menu button {
-  font: inherit; padding: 10px 14px;
-  background: #1a1a1a; color: #eee;
-  border: 1px solid #444; border-radius: 4px;
-  width: 260px;
-}
-#menu button { cursor: pointer; background: #2a3a2a; }
-#menu button:hover { background: #354a35; }
-#menu button:disabled { opacity: 0.5; cursor: default; }
-.label { font-size: 12px; color: #888; margin-top: 6px; }
-.hint  { font-size: 12px; color: #666; max-width: 320px; }
-#status { color: #8ac; min-height: 20px; }
-"""
-
-# ---------------------------------------------------------- public/js/input.js
-FILES["public/js/input.js"] = """export class Input {
+FILES["public/js/input.js"] = r'''export class Input {
   constructor() {
     this.keys = new Set();
-    window.addEventListener('keydown', e => this.keys.add(e.code));
-    window.addEventListener('keyup',   e => this.keys.delete(e.code));
+    this.mouse = { x: 0, y: 0, down: false };
+    window.addEventListener('keydown', (e) => this.keys.add(e.code));
+    window.addEventListener('keyup', (e) => this.keys.delete(e.code));
+    window.addEventListener('blur', () => this.keys.clear());
   }
   isDown(code) { return this.keys.has(code); }
-}
-"""
-
-# --------------------------------------------------------- public/js/camera.js
-FILES["public/js/camera.js"] = """export class Camera {
-  constructor(w, h) { this.w = w; this.h = h; this.x = 0; this.y = 0; }
-  follow(t) { this.x = t.x - this.w / 2; this.y = t.y - this.h / 2; }
-  toScreen(x, y) { return { x: x - this.x, y: y - this.y }; }
-}
-"""
-
-# ---------------------------------------------------------- public/js/world.js
-FILES["public/js/world.js"] = """const SEED = 12345;
-function rng(seed) {
-  return function () {
-    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-export class World {
-  constructor() {
-    this.tileSize = 32;
-    this.cols = 60;
-    this.rows = 45;
-    const r = rng(SEED);
-    this.tiles = [];
-    for (let y = 0; y < this.rows; y++) {
-      const row = [];
-      for (let x = 0; x < this.cols; x++) {
-        const border = x === 0 || y === 0 || x === this.cols - 1 || y === this.rows - 1;
-        const safe = x < 12 && y < 12;
-        row.push(border || (!safe && r() < 0.06) ? 1 : 0);
-      }
-      this.tiles.push(row);
-    }
-  }
-  isSolid(px, py) {
-    const t = this.tileSize;
-    const tx = Math.floor(px / t), ty = Math.floor(py / t);
-    if (tx < 0 || ty < 0 || tx >= this.cols || ty >= this.rows) return true;
-    return this.tiles[ty][tx] === 1;
-  }
-  isBlocked(x, y, r) {
-    return this.isSolid(x - r, y - r) || this.isSolid(x + r, y - r)
-        || this.isSolid(x - r, y + r) || this.isSolid(x + r, y + r);
-  }
-  render(ctx, cam) {
-    const t = this.tileSize;
-    const x0 = Math.max(0, Math.floor(cam.x / t));
-    const y0 = Math.max(0, Math.floor(cam.y / t));
-    const x1 = Math.min(this.cols, Math.ceil((cam.x + cam.w) / t));
-    const y1 = Math.min(this.rows, Math.ceil((cam.y + cam.h) / t));
-    for (let y = y0; y < y1; y++) {
-      for (let x = x0; x < x1; x++) {
-        const s = cam.toScreen(x * t, y * t);
-        ctx.fillStyle = this.tiles[y][x] === 1 ? '#3a3a44' : '#24331f';
-        ctx.fillRect(s.x, s.y, t, t);
-        ctx.strokeStyle = 'rgba(0,0,0,0.15)';
-        ctx.strokeRect(s.x + 0.5, s.y + 0.5, t, t);
-      }
-    }
-  }
-}
-"""
-
-# --------------------------------------------------------- public/js/player.js
-FILES["public/js/player.js"] = """export class Player {
-  constructor(x, y) { this.x = x; this.y = y; this.speed = 220; this.radius = 12; }
-
-  update(dt, input, world) {
+  getMove() {
     let dx = 0, dy = 0;
-    if (input.isDown('KeyW') || input.isDown('ArrowUp'))    dy -= 1;
-    if (input.isDown('KeyS') || input.isDown('ArrowDown'))  dy += 1;
-    if (input.isDown('KeyA') || input.isDown('ArrowLeft'))  dx -= 1;
-    if (input.isDown('KeyD') || input.isDown('ArrowRight')) dx += 1;
-    if (!dx && !dy) return;
-    const len = Math.hypot(dx, dy); dx /= len; dy /= len;
-    const sx = dx * this.speed * dt, sy = dy * this.speed * dt;
-    if (!world.isBlocked(this.x + sx, this.y, this.radius)) this.x += sx;
-    if (!world.isBlocked(this.x, this.y + sy, this.radius)) this.y += sy;
+    if (this.isDown('KeyA') || this.isDown('ArrowLeft')) dx -= 1;
+    if (this.isDown('KeyD') || this.isDown('ArrowRight')) dx += 1;
+    if (this.isDown('KeyW') || this.isDown('ArrowUp')) dy -= 1;
+    if (this.isDown('KeyS') || this.isDown('ArrowDown')) dy += 1;
+    return { dx, dy };
   }
 }
-"""
+'''
 
-# ------------------------------------------------------------ public/js/net.js
-FILES["public/js/net.js"] = """export class Net {
+FILES["public/js/net.js"] = r'''export class Net {
   constructor() {
-    this.ws = null;
     this.id = null;
-    this.players = new Map();     // id -> {id, name, hue, x, y, tx, ty}
-    this.onInit = null;
-    this.onDisconnect = null;
+    this.players = new Map();
+    this.enemies = new Map();
+    this.projectiles = new Map();
+    this.map = null;
+    this.ws = null;
+    this.handlers = {};
   }
-
-  connect(url, name) {
-    return new Promise((resolve, reject) => {
-      try { this.ws = new WebSocket(url); }
-      catch { return reject(new Error('Неверный адрес')); }
-
-      const timeout = setTimeout(() => reject(new Error('Таймаут подключения')), 6000);
-
-      this.ws.onopen = () => {
-        this.ws.send(JSON.stringify({ type: 'join', name }));
-      };
-      this.ws.onerror = () => {
-        clearTimeout(timeout);
-        reject(new Error('Не удалось подключиться'));
-      };
-      this.ws.onclose = () => {
-        clearTimeout(timeout);
-        this.onDisconnect?.();
-      };
-      this.ws.onmessage = e => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'init') {
-          clearTimeout(timeout);
-          this.id = msg.id;
-          for (const p of msg.players) this.players.set(p.id, { ...p, tx: p.x, ty: p.y });
-          this.onInit?.(msg);
-          resolve();
-        } else {
-          this._handle(msg);
-        }
+  connect(url) {
+    return new Promise((resolve) => {
+      const ws = new WebSocket(url);
+      this.ws = ws;
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        this._handle(msg);
+        if (msg.type === 'init') resolve();
       };
     });
   }
+  on(type, fn) { (this.handlers[type] ||= []).push(fn); }
+  emit(type, data) { (this.handlers[type] || []).forEach(fn => fn(data)); }
 
   _handle(msg) {
-    if (msg.type === 'join') {
-      this.players.set(msg.player.id, { ...msg.player, tx: msg.player.x, ty: msg.player.y });
+    if (msg.type === 'init') {
+      this.id = msg.id;
+      this.map = msg.map;
+      this.players.clear();
+      msg.players.forEach(p => this.players.set(p.id, p));
+      this.enemies.clear();
+      msg.enemies.forEach(e => this.enemies.set(e.id, e));
+      this.projectiles.clear();
+      msg.projectiles.forEach(p => this.projectiles.set(p.id, p));
+      this.emit('init', msg);
+    } else if (msg.type === 'join') {
+      this.players.set(msg.player.id, msg.player);
     } else if (msg.type === 'leave') {
       this.players.delete(msg.id);
     } else if (msg.type === 'state') {
-      for (const p of msg.players) {
-        if (p.id === this.id) continue;
-        const local = this.players.get(p.id);
-        if (local) { local.tx = p.x; local.ty = p.y; }
+      const seen = new Set();
+      msg.players.forEach(p => {
+        seen.add(p.id);
+        const existing = this.players.get(p.id);
+        if (existing) Object.assign(existing, p);
+        else this.players.set(p.id, p);
+      });
+      for (const pid of [...this.players.keys()]) {
+        if (!seen.has(pid)) this.players.delete(pid);
+      }
+      this.enemies.clear();
+      msg.enemies.forEach(e => this.enemies.set(e.id, e));
+      this.projectiles.clear();
+      msg.projectiles.forEach(p => this.projectiles.set(p.id, p));
+      this.emit('state', msg);
+    }
+  }
+
+  getSelf() {
+    return this.id != null ? this.players.get(this.id) : null;
+  }
+  sendMove(dx, dy) {
+    if (this.ws?.readyState === 1) {
+      this.ws.send(JSON.stringify({ type: 'move', dx, dy }));
+    }
+  }
+  sendAttack(angle) {
+    if (this.ws?.readyState === 1) {
+      this.ws.send(JSON.stringify({ type: 'attack', angle }));
+    }
+  }
+}
+'''
+
+FILES["public/js/main.js"] = r'''import { Net } from './net.js';
+import { Input } from './input.js';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+
+const TILE = 32;
+const CAM_LERP = 0.15;
+
+const net = new Net();
+const input = new Input();
+
+const camera = { x: 0, y: 0 };
+let mapData = null;
+let myPlayer = null;
+let camInit = false;
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+window.addEventListener('mousemove', (e) => {
+  input.mouse.x = e.clientX;
+  input.mouse.y = e.clientY;
+});
+
+window.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (!myPlayer) return;
+  const wx = e.clientX + camera.x;
+  const wy = e.clientY + camera.y;
+  const angle = Math.atan2(wy - myPlayer.y, wx - myPlayer.x);
+  net.sendAttack(angle);
+});
+
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+net.connect(`${wsProto}//${location.host}`).then(() => {
+  mapData = net.map;
+});
+
+setInterval(() => {
+  const { dx, dy } = input.getMove();
+  net.sendMove(dx, dy);
+}, 50);
+
+function draw() {
+  requestAnimationFrame(draw);
+
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  myPlayer = net.getSelf();
+  if (!myPlayer || !mapData) return;
+
+  const targetCamX = myPlayer.x - canvas.width / 2;
+  const targetCamY = myPlayer.y - canvas.height / 2;
+  if (!camInit) {
+    camera.x = targetCamX; camera.y = targetCamY; camInit = true;
+  } else {
+    camera.x += (targetCamX - camera.x) * CAM_LERP;
+    camera.y += (targetCamY - camera.y) * CAM_LERP;
+  }
+
+  const ox = -camera.x;
+  const oy = -camera.y;
+
+  const tiles = mapData.tiles;
+  const x0 = Math.max(0, Math.floor(camera.x / TILE));
+  const y0 = Math.max(0, Math.floor(camera.y / TILE));
+  const x1 = Math.min(mapData.w, Math.ceil((camera.x + canvas.width) / TILE));
+  const y1 = Math.min(mapData.h, Math.ceil((camera.y + canvas.height) / TILE));
+
+  for (let ty = y0; ty < y1; ty++) {
+    for (let tx = x0; tx < x1; tx++) {
+      const isWall = tiles[ty][tx] === 1;
+      ctx.fillStyle = isWall ? '#333' : '#1e1e1e';
+      ctx.fillRect(tx * TILE + ox, ty * TILE + oy, TILE, TILE);
+      if (!isWall) {
+        ctx.strokeStyle = '#262626';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(tx * TILE + ox + 0.5, ty * TILE + oy + 0.5, TILE - 1, TILE - 1);
       }
     }
   }
 
-  sendState(x, y) {
-    if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ type: 'state', x, y }));
-  }
-}
-"""
+  for (const e of net.enemies.values()) {
+    const sx = e.x + ox, sy = e.y + oy;
+    ctx.fillStyle = '#c0392b';
+    ctx.beginPath();
+    ctx.arc(sx, sy, e.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#e74c3c';
+    ctx.lineWidth = 2;
+    ctx.stroke();
 
-# ----------------------------------------------------------- public/js/main.js
-FILES["public/js/main.js"] = """import { Input }  from './input.js';
-import { Camera } from './camera.js';
-import { World }  from './world.js';
-import { Player } from './player.js';
-import { Net }    from './net.js';
-
-const canvas = document.getElementById('game');
-const ctx    = canvas.getContext('2d');
-
-const input  = new Input();
-const world  = new World();
-const camera = new Camera(canvas.width, canvas.height);
-const net    = new Net();
-
-let player = null;
-let playing = false;
-let sendTimer = 0;
-
-// ---------- меню ----------
-const menu    = document.getElementById('menu');
-const nameIn  = document.getElementById('name');
-const hostIp  = document.getElementById('hostIp');
-const playBtn = document.getElementById('playBtn');
-const status  = document.getElementById('status');
-const hint    = document.getElementById('selfHint');
-
-// подсказки по ситуации
-if (location.protocol === 'file:') {
-  hostIp.placeholder = 'введи Radmin-IP хоста';
-  hint.textContent = 'Файл открыт локально — нужен IP хоста.';
-} else if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-  hint.textContent = 'Ты на localhost — оставь поле пустым (ты хост).';
-} else {
-  hostIp.value = location.hostname;   // друг открыл через Radmin-IP
-  hint.textContent = 'Поле уже заполнено — просто нажми «Подключиться».';
-}
-
-playBtn.onclick = async () => {
-  playBtn.disabled = true;
-  status.textContent = 'Подключаемся…';
-
-  const name = nameIn.value.trim() || 'Player';
-  const ip   = hostIp.value.trim();
-
-  let url;
-  if (!ip) {
-    // пусто → подключаемся к тому же хосту, откуда открыта страница
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    url = `${proto}://${location.host}`;
-  } else {
-    url = `ws://${ip}:3000`;
-  }
-
-  net.onDisconnect = () => {
-    status.textContent = 'Соединение потеряно';
-    playBtn.disabled = false;
-    playing = false;
-    menu.hidden = false;
-  };
-
-  net.onInit = () => {
-    const me = net.players.get(net.id);
-    player = new Player(me.x, me.y);
-    camera.follow(player);
-    playing = true;
-    menu.hidden = true;
-  };
-
-  try {
-    await net.connect(url, name);
-  } catch (e) {
-    status.textContent = 'Ошибка: ' + e.message;
-    playBtn.disabled = false;
-  }
-};
-
-// ---------- апдейт ----------
-function update(dt) {
-  if (!playing || !player) return;
-
-  player.update(dt, input, world);
-  camera.follow(player);
-
-  sendTimer += dt;
-  if (sendTimer >= 0.05) {
-    sendTimer = 0;
-    net.sendState(player.x, player.y);
+    const hpW = 30;
+    const hpX = sx - hpW / 2;
+    const hpY = sy - e.radius - 8;
+    ctx.fillStyle = '#222';
+    ctx.fillRect(hpX, hpY, hpW, 4);
+    ctx.fillStyle = '#e74c3c';
+    ctx.fillRect(hpX, hpY, hpW * (e.hp / e.maxHp), 4);
   }
 
   for (const p of net.players.values()) {
-    if (p.id === net.id) continue;
-    p.x += (p.tx - p.x) * 0.25;
-    p.y += (p.ty - p.y) * 0.25;
-  }
-}
-
-// ---------- рендер ----------
-function drawPlayer(x, y, name, hue, isSelf) {
-  const s = camera.toScreen(x, y);
-
-  ctx.fillStyle = `hsl(${hue} 65% ${isSelf ? 60 : 50}%)`;
-  ctx.beginPath();
-  ctx.arc(s.x, s.y, 12, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.strokeStyle = isSelf ? '#fff' : 'rgba(0,0,0,0.6)';
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  ctx.font = '12px system-ui';
-  ctx.textAlign = 'center';
-  ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillText(name, s.x + 1, s.y - 17);
-  ctx.fillStyle = '#fff';
-  ctx.fillText(name, s.x, s.y - 18);
-}
-
-function render() {
-  ctx.fillStyle = '#111';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  world.render(ctx, camera);
-
-  for (const p of net.players.values()) {
-    if (p.id === net.id) continue;
-    drawPlayer(p.x, p.y, p.name, p.hue, false);
+    if (p.id === myPlayer.id) continue;
+    const sx = p.x + ox, sy = p.y + oy;
+    ctx.fillStyle = '#3498db';
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#5dade2';
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 
-  if (player) {
-    const me = net.players.get(net.id);
-    drawPlayer(player.x, player.y, me.name, me.hue, true);
+  {
+    const sx = myPlayer.x + ox;
+    const sy = myPlayer.y + oy;
+    ctx.fillStyle = '#2ecc71';
+    ctx.beginPath();
+    ctx.arc(sx, sy, myPlayer.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#58d68d';
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 
-  ctx.font = '14px monospace';
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#aaa';
-  ctx.fillText(`игроков: ${net.players.size}`, 10, 22);
+  for (const pr of net.projectiles.values()) {
+    const sx = pr.x + ox, sy = pr.y + oy;
+    ctx.fillStyle = '#f1c40f';
+    ctx.beginPath();
+    ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  if (input.mouse.x || input.mouse.y) {
+    ctx.strokeStyle = 'rgba(241,196,15,0.85)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(input.mouse.x, input.mouse.y, 8, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(input.mouse.x - 12, input.mouse.y);
+    ctx.lineTo(input.mouse.x + 12, input.mouse.y);
+    ctx.moveTo(input.mouse.x, input.mouse.y - 12);
+    ctx.lineTo(input.mouse.x, input.mouse.y + 12);
+    ctx.stroke();
+  }
+
+  hud.textContent = `HP: ${Math.max(0, Math.round(myPlayer.hp))}/${myPlayer.maxHp}   Врагов: ${net.enemies.size}`;
 }
+draw();
+'''
 
-// ---------- цикл ----------
-let last = performance.now();
-function loop(now) {
-  const dt = Math.min((now - last) / 1000, 0.05);
-  last = now;
-  update(dt);
-  render();
-  requestAnimationFrame(loop);
-}
-requestAnimationFrame(loop);
-"""
+# ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    root = Path.cwd()
-    print(f"Создаю проект в: {root}\n")
+def write_file(path: Path, content: str, dry: bool) -> str:
+    if path.exists():
+        old = path.read_text(encoding="utf-8")
+        if old == content:
+            return "уже актуально"
+        if not dry:
+            bak = path.with_suffix(path.suffix + ".bak")
+            if not bak.exists():
+                shutil.copy2(path, bak)
+            path.write_text(content, encoding="utf-8")
+        return "заменено (бэкап .bak)"
+    else:
+        if not dry:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        return "создано"
 
-    created = []
-    for rel_path, content in FILES.items():
-        path = root / rel_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8", newline="\n")
-        created.append(rel_path)
 
-    print(f"Готово. Создано файлов: {len(created)}\n")
-    for rel in created:
-        print(f"  {rel}")
+def revert() -> int:
+    any_restored = False
+    for name in FILES:
+        p = Path(name)
+        bak = p.with_suffix(p.suffix + ".bak")
+        if bak.exists():
+            shutil.copy2(bak, p)
+            bak.unlink()
+            print(f"  ↺ {p}")
+            any_restored = True
+        else:
+            print(f"  – {p}: .bak нет")
+    if not any_restored:
+        print("Нечего восстанавливать.")
+        return 1
+    print("Готово.")
+    return 0
 
-    print("\nСтруктура проекта:")
-    print("  package.json")
-    print("  server.js")
-    print("  public/")
-    print("    index.html")
-    print("    style.css")
-    print("    js/")
-    print("      main.js")
-    print("      input.js")
-    print("      camera.js")
-    print("      world.js")
-    print("      player.js")
-    print("      net.js")
 
-    print("\nСледующие шаги:")
-    print("  1. npm install")
-    print("  2. npm start")
-    print("  3. Ты (хост):  http://localhost:3000")
-    print("  4. Друг:       http://<твой-radmin-ip>:3000")
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true",
+                    help="только показать, что будет сделано")
+    ap.add_argument("--revert", action="store_true",
+                    help="восстановить файлы из .bak")
+    args = ap.parse_args()
+
+    if args.revert:
+        print("== revert ==")
+        return revert()
+
+    print(f"== replace_files ==  ({'dry-run' if args.dry_run else 'apply'})\n")
+
+    for name, content in FILES.items():
+        p = Path(name)
+        result = write_file(p, content, args.dry_run)
+        print(f"  {p}: {result}")
+
     print()
-    print("Если не коннектится — разреши Node.js в брандмауэре Windows")
-    print("(частные сети) и проверь, что Radmin VPN активен у обоих.")
+    if args.dry_run:
+        print("dry-run завершён, ничего не записано.")
+        return 0
+
+    print("Готово. Дальше:")
+    print("  npm install")
+    print("  npm start")
+    print("Открой http://localhost:3000 в браузере с очисткой кеша (Ctrl+Shift+R).")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

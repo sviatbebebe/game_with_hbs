@@ -1,103 +1,256 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
-import http from 'http';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
-import { fileURLToPath } from 'url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 3000;
-const PUBLIC = path.join(__dirname, 'public');
-const MIME = { '.html':'text/html', '.js':'text/javascript', '.css':'text/css', '.png':'image/png' };
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// ---------- статика ----------
-const httpServer = http.createServer((req, res) => {
-  let urlPath = req.url.split('?')[0];
+const PORT = process.env.PORT || 3000;
+const TILE = 32;
+const MAP_W = 60;
+const MAP_H = 45;
+
+// карта: 0 — пол, 1 — стена
+const map = [];
+for (let y = 0; y < MAP_H; y++) {
+  const row = [];
+  for (let x = 0; x < MAP_W; x++) {
+    const border = x === 0 || y === 0 || x === MAP_W - 1 || y === MAP_H - 1;
+    const block = x % 10 === 0 && y % 10 === 0 && x > 0 && y > 0 && x < MAP_W - 1 && y < MAP_H - 1;
+    row.push(border || block ? 1 : 0);
+  }
+  map.push(row);
+}
+
+function isSolid(x, y) {
+  const tx = Math.floor(x / TILE);
+  const ty = Math.floor(y / TILE);
+  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
+  return map[ty][tx] === 1;
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png',
+  '.json': 'application/json; charset=utf-8',
+};
+
+const server = http.createServer((req, res) => {
+  let urlPath = decodeURIComponent(req.url.split('?')[0]);
   if (urlPath === '/') urlPath = '/index.html';
-  const filePath = path.join(PUBLIC, urlPath);
-  if (!filePath.startsWith(PUBLIC)) { res.writeHead(403); res.end(); return; }
+  const root = path.join(__dirname, 'public');
+  const filePath = path.join(root, urlPath);
+  if (!filePath.startsWith(root)) {
+    res.writeHead(403); res.end('forbidden'); return;
+  }
   fs.readFile(filePath, (err, data) => {
-    if (err) { res.writeHead(404); res.end('Not found'); return; }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream' });
+    if (err) { res.writeHead(404); res.end('not found'); return; }
+    const ext = path.extname(filePath);
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
     res.end(data);
   });
 });
 
-// ---------- WebSocket ----------
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server });
+
 const players = new Map();
-let nextId = 1;
+const enemies = new Map();
+const projectiles = new Map();
+let nextPlayerId = 1;
+let nextEnemyId = 1;
+let nextProjectileId = 1;
 
-const TILE = 32;
-const SPAWNS = [
-  { x: TILE*4, y: TILE*4 },
-  { x: TILE*6, y: TILE*4 },
-  { x: TILE*4, y: TILE*6 },
-  { x: TILE*6, y: TILE*6 },
-];
+const PLAYER_RADIUS = 14;
+const PLAYER_SPEED = 180;
+const PLAYER_HP = 100;
 
-function broadcast(obj, exceptId = null) {
-  const data = JSON.stringify(obj);
-  for (const ws of wss.clients) {
-    if (ws.readyState !== 1 || ws.playerId === exceptId) continue;
-    ws.send(data);
+const ENEMY_SPEED = 70;
+const ENEMY_HP = 30;
+const ENEMY_RADIUS = 14;
+const ENEMY_DAMAGE = 10;
+const ENEMY_ATTACK_CD = 1.0;
+
+const PROJ_SPEED = 500;
+const PROJ_RADIUS = 5;
+const PROJ_DAMAGE = 10;
+const PROJ_TTL = 1.5;
+
+function findSpawn() {
+  for (let i = 0; i < 300; i++) {
+    const x = (5 + Math.random() * (MAP_W - 10)) * TILE;
+    const y = (5 + Math.random() * (MAP_H - 10)) * TILE;
+    if (!isSolid(x, y)) return { x, y };
+  }
+  return { x: TILE * 2, y: TILE * 2 };
+}
+
+function spawnEnemy() {
+  for (let i = 0; i < 100; i++) {
+    const x = (5 + Math.random() * (MAP_W - 10)) * TILE;
+    const y = (5 + Math.random() * (MAP_H - 10)) * TILE;
+    if (isSolid(x, y)) continue;
+    let tooClose = false;
+    for (const p of players.values()) {
+      if (Math.hypot(p.x - x, p.y - y) < 250) { tooClose = true; break; }
+    }
+    if (tooClose) continue;
+    const id = nextEnemyId++;
+    enemies.set(id, {
+      id, x, y,
+      hp: ENEMY_HP, maxHp: ENEMY_HP,
+      radius: ENEMY_RADIUS,
+      speed: ENEMY_SPEED,
+      lastHit: 0,
+    });
+    return;
   }
 }
 
-wss.on('connection', ws => {
-  const id = nextId++;
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  for (const ws of wss.clients) {
+    if (ws.readyState === 1) ws.send(data);
+  }
+}
+
+wss.on('connection', (ws) => {
+  const id = nextPlayerId++;
+  const spawn = findSpawn();
+  const player = {
+    id,
+    x: spawn.x, y: spawn.y,
+    radius: PLAYER_RADIUS,
+    hp: PLAYER_HP, maxHp: PLAYER_HP,
+    dirX: 0, dirY: 0,
+  };
+  players.set(id, player);
   ws.playerId = id;
 
-  ws.on('message', raw => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
+  ws.send(JSON.stringify({
+    type: 'init',
+    id,
+    map: { tiles: map, tile: TILE, w: MAP_W, h: MAP_H },
+    players: [...players.values()],
+    enemies: [...enemies.values()],
+    projectiles: [...projectiles.values()],
+  }));
 
-    if (msg.type === 'join') {
-      const sp = SPAWNS[(id - 1) % SPAWNS.length];
-      const player = {
-        id,
-        name: String(msg.name || 'Player').slice(0, 12),
-        x: sp.x, y: sp.y,
-        hue: (id * 137) % 360,
-      };
-      players.set(id, player);
-      console.log(`+ ${player.name} (id=${id}) — всего ${players.size}`);
+  broadcast({ type: 'join', player });
 
-      ws.send(JSON.stringify({ type: 'init', id, players: [...players.values()] }));
-      broadcast({ type: 'join', player }, id);
-    }
-    else if (msg.type === 'state') {
-      const p = players.get(id);
-      if (p) { p.x = msg.x; p.y = msg.y; }
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    const p = players.get(id);
+    if (!p) return;
+    if (msg.type === 'move') {
+      p.dirX = Number(msg.dx) || 0;
+      p.dirY = Number(msg.dy) || 0;
+    } else if (msg.type === 'attack') {
+      const a = Number(msg.angle) || 0;
+      const pid = nextProjectileId++;
+      projectiles.set(pid, {
+        id: pid,
+        x: p.x + Math.cos(a) * (p.radius + 4),
+        y: p.y + Math.sin(a) * (p.radius + 4),
+        vx: Math.cos(a) * PROJ_SPEED,
+        vy: Math.sin(a) * PROJ_SPEED,
+        ownerId: id,
+        ttl: PROJ_TTL,
+      });
     }
   });
 
   ws.on('close', () => {
-    const p = players.get(id);
-    if (!p) return;
     players.delete(id);
     broadcast({ type: 'leave', id });
-    console.log(`- ${p.name} вышел — всего ${players.size}`);
   });
 });
 
-// рассылка 20 раз в секунду
+function movePlayer(p, dt) {
+  const len = Math.hypot(p.dirX, p.dirY) || 1;
+  const nx = (p.dirX / len) * PLAYER_SPEED * dt;
+  const ny = (p.dirY / len) * PLAYER_SPEED * dt;
+  const newX = p.x + nx;
+  const newY = p.y + ny;
+  if (!isSolid(newX, p.y)) p.x = newX;
+  if (!isSolid(p.x, newY)) p.y = newY;
+}
+
+function updateEnemies(dt, now) {
+  for (const e of enemies.values()) {
+    let nearest = null, minD = Infinity;
+    for (const p of players.values()) {
+      const d = Math.hypot(p.x - e.x, p.y - e.y);
+      if (d < minD) { minD = d; nearest = p; }
+    }
+    if (!nearest) continue;
+
+    if (minD < e.radius + nearest.radius + 4) {
+      if (now - e.lastHit > ENEMY_ATTACK_CD * 1000) {
+        nearest.hp -= ENEMY_DAMAGE;
+        e.lastHit = now;
+        if (nearest.hp <= 0) {
+          const sp = findSpawn();
+          nearest.x = sp.x; nearest.y = sp.y;
+          nearest.hp = nearest.maxHp;
+        }
+      }
+      continue;
+    }
+    const dx = nearest.x - e.x, dy = nearest.y - e.y;
+    const l = Math.hypot(dx, dy) || 1;
+    const nx = e.x + (dx / l) * e.speed * dt;
+    const ny = e.y + (dy / l) * e.speed * dt;
+    if (!isSolid(nx, e.y)) e.x = nx;
+    if (!isSolid(e.x, ny)) e.y = ny;
+  }
+}
+
+function updateProjectiles(dt) {
+  for (const [id, pr] of projectiles) {
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
+    pr.ttl -= dt;
+    if (pr.ttl <= 0 || isSolid(pr.x, pr.y)) { projectiles.delete(id); continue; }
+    let hit = false;
+    for (const e of enemies.values()) {
+      if (Math.hypot(pr.x - e.x, pr.y - e.y) < e.radius + PROJ_RADIUS) {
+        e.hp -= PROJ_DAMAGE;
+        if (e.hp <= 0) enemies.delete(e.id);
+        hit = true;
+        break;
+      }
+    }
+    if (hit) projectiles.delete(id);
+  }
+}
+
+let lastTick = Date.now();
 setInterval(() => {
-  if (!players.size) return;
-  broadcast({ type: 'state', players: [...players.values()] });
+  const now = Date.now();
+  const dt = Math.min((now - lastTick) / 1000, 0.1);
+  lastTick = now;
+
+  for (const p of players.values()) movePlayer(p, dt);
+  updateEnemies(dt, now);
+  updateProjectiles(dt);
+
+  broadcast({
+    type: 'state',
+    players: [...players.values()],
+    enemies: [...enemies.values()],
+    projectiles: [...projectiles.values()],
+  });
 }, 50);
 
-// ---------- запуск ----------
-httpServer.listen(PORT, '0.0.0.0', () => {
-  const ips = [];
-  for (const iface of Object.values(os.networkInterfaces())) {
-    for (const info of iface) {
-      if (info.family === 'IPv4' && !info.internal) ips.push(info.address);
-    }
-  }
-  console.log('=== Server running ===');
-  console.log(`  local:  http://localhost:${PORT}`);
-  for (const ip of ips) {
-    const tag = ip.startsWith('26.') ? ' ← Radmin (этот дай другу)' : '';
-    console.log(`  LAN:    http://${ip}:${PORT}${tag}`);
-  }
+setInterval(() => {
+  if (players.size > 0 && enemies.size < 8) spawnEnemy();
+}, 2500);
+
+server.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
 });
