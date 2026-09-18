@@ -10,6 +10,9 @@ export class Net {
     this.items = {};
     this.ws = null;
     this.handlers = {};
+    // время снапшотов для интерполяции
+    this.lastStateAt = 0;
+    this.stateInterval = 63;
   }
 
   connect(url) {
@@ -28,6 +31,7 @@ export class Net {
   emit(type, data) { (this.handlers[type] || []).forEach(fn => fn(data)); }
 
   _handle(msg) {
+    if (msg.type === 'levelUp') { this.emit('levelUp', msg); return; }
     if (msg.type === 'init') {
       this.id = msg.id;
       this.hostId = msg.hostId;
@@ -68,16 +72,22 @@ export class Net {
       this.emit('tileChange', msg);
     } else if (msg.type === 'state') {
       this.gameState = 'playing';
-      const seen = new Set();
-      msg.players.forEach(p => {
-        seen.add(p.id);
-        const ex = this.players.get(p.id);
-        if (ex) Object.assign(ex, p);
-        else this.players.set(p.id, p);
-      });
-      for (const pid of [...this.players.keys()]) if (!seen.has(pid)) this.players.delete(pid);
-      this.enemies.clear(); msg.enemies.forEach(e => this.enemies.set(e.id, e));
-      this.projectiles.clear(); msg.projectiles.forEach(p => this.projectiles.set(p.id, p));
+      const now = performance.now();
+      if (this.lastStateAt) { this.stateInterval = now - this.lastStateAt; }
+      this.lastStateAt = now;
+      const merge = (map, arr) => {
+        const seen = new Set();
+        arr.forEach(o => {
+          seen.add(o.id);
+          const ex = map.get(o.id);
+          if (ex) { ex.px = ex.x; ex.py = ex.y; Object.assign(ex, o); }
+          else map.set(o.id, Object.assign({ px: o.x, py: o.y }, o));
+        });
+        for (const k of [...map.keys()]) if (!seen.has(k)) map.delete(k);
+      };
+      merge(this.players, msg.players);
+      merge(this.enemies, msg.enemies);
+      merge(this.projectiles, msg.projectiles);
       this.emit('state', msg);
     }
   }
@@ -92,4 +102,8 @@ export class Net {
   sendMove(dx, dy) { this._send({ type: 'move', dx, dy }); }
   sendAttack(angle) { this._send({ type: 'attack', angle }); }
   sendMelee(angle) { this._send({ type: 'melee', angle }); }
+  sendSpendPoint(stat) { this._send({ type: 'spendPoint', stat }); }
+  sendCraft(recipe) { this._send({ type: 'craft', recipe }); }
+  sendEat(item) { if (item) this._send({ type: 'eat', item }); else this._send({ type: 'eat' }); }
+  sendPlace(tx, ty) { this._send({ type: 'place', tx, ty }); }
 }

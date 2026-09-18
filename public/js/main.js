@@ -24,6 +24,8 @@ const T_FLOOR = 3;
 const net = new Net();
 const input = new Input();
 
+window.gameApi = { sendSpendPoint: (stat) => net.sendSpendPoint(stat), sendCraft: (recipe) => net.sendCraft(recipe), sendEat: (item) => net.sendEat(item), sendPlace: (tx, ty) => net.sendPlace(tx, ty), getLocalPlayer: () => net.getSelf() };
+
 const camera = { x: 0, y: 0 };
 let mapData = null;
 let myPlayer = null;
@@ -46,8 +48,16 @@ window.addEventListener('mousedown', (e) => {
   const wx = e.clientX + camera.x;
   const wy = e.clientY + camera.y;
   const angle = Math.atan2(wy - myPlayer.y, wx - myPlayer.x);
+  if (e.button === 0 && input.isDown('KeyF')) {
+    net.sendPlace(Math.floor(wx / TILE), Math.floor(wy / TILE));
+    return;
+  }
   if (e.button === 0) net.sendAttack(angle);
   else if (e.button === 2) net.sendMelee(angle);
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyE' && !e.repeat && net.gameState === 'playing') net.sendEat();
 });
 
 // ---------- процедурный шум для текстур ----------
@@ -299,6 +309,41 @@ function drawInventory(player) {
   }
 }
 
+// ---------- прогресс уровня ----------
+function drawProgress(p) {
+  const w = 300;
+  const h = 10;
+  const x = (canvas.width - w) / 2;
+  const y = canvas.height - 30;
+  const xp = p.xp || 0;
+  const xpNext = p.xpNext || 0;
+  const ratio = xpNext > 0 ? Math.max(0, Math.min(1, xp / xpNext)) : 0;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = '#2ecc71';
+  ctx.fillRect(x, y, w * ratio, h);
+  ctx.strokeStyle = '#444';
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  const level = p.level || 1;
+  const pts = p.points || 0;
+  ctx.fillStyle = '#fff';
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Ур. ' + level + '  Опыт ' + xp + '/' + xpNext + '  Очки: ' + pts, canvas.width / 2, y + h + 10);
+}
+
+// ---------- интерполяция между серверными снапшотами ----------
+const TELEPORT_DIST = 150;
+function interpPos(o) {
+  if (o.px === undefined) return { x: o.x, y: o.y };
+  const dx = o.x - o.px, dy = o.y - o.py;
+  if (dx * dx + dy * dy > TELEPORT_DIST * TELEPORT_DIST) return { x: o.x, y: o.y };
+  const iv = Math.max(1, net.stateInterval || 63);
+  const a = Math.min(1, (performance.now() - net.lastStateAt) / iv);
+  return { x: o.px + dx * a, y: o.py + dy * a };
+}
+
 // ---------- отрисовка ----------
 function draw() {
   requestAnimationFrame(draw);
@@ -333,7 +378,7 @@ function draw() {
 
   // враги
   for (const e of net.enemies.values()) {
-    const sx = e.x + ox, sy = e.y + oy;
+    const ep = interpPos(e); const sx = ep.x + ox, sy = ep.y + oy;
     const shape = e.type === 'melee' ? 'square'
                 : e.type === 'ranged' ? 'circle'
                 : 'pentagon';
@@ -357,7 +402,7 @@ function draw() {
   // другие игроки
   for (const p of net.players.values()) {
     if (p.id === myPlayer.id) continue;
-    const sx = p.x + ox, sy = p.y + oy;
+    const pp = interpPos(p); const sx = pp.x + ox, sy = pp.y + oy;
     ctx.fillStyle = '#3498db';
     ctx.beginPath(); ctx.arc(sx, sy, p.radius, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = '#5dade2'; ctx.lineWidth = 2; ctx.stroke();
@@ -365,7 +410,7 @@ function draw() {
 
   // я
   {
-    const sx = myPlayer.x + ox, sy = myPlayer.y + oy;
+    const mp = interpPos(myPlayer); const sx = mp.x + ox, sy = mp.y + oy;
     ctx.fillStyle = '#2ecc71';
     ctx.beginPath(); ctx.arc(sx, sy, myPlayer.radius, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = '#58d68d'; ctx.lineWidth = 2; ctx.stroke();
@@ -373,7 +418,7 @@ function draw() {
 
   // снаряды
   for (const pr of net.projectiles.values()) {
-    const sx = pr.x + ox, sy = pr.y + oy;
+    const qp = interpPos(pr); const sx = qp.x + ox, sy = qp.y + oy;
     if (pr.ownerType === 'enemy') {
       ctx.fillStyle = '#e67e22';
       ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
@@ -398,6 +443,7 @@ function draw() {
 
   // инвентарь
   drawInventory(myPlayer);
+  drawProgress(myPlayer);
 
   // HUD (снизу слева, чтобы не мешать инвентарю)
   hud.textContent = 'HP: ' + Math.max(0, Math.round(myPlayer.hp)) + '/' + myPlayer.maxHp

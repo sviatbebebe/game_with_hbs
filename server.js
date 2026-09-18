@@ -172,6 +172,17 @@ const playerMeleeLast = new Map();
 
 const LOOT_CHANCE = 0.35;
 
+// ---------- прогрессия ----------
+const XP_SHARE_RADIUS = 400;
+const XP_BASE = 100;
+const XP_EXP = 1.5;
+function xpForLevel(level) {
+  return Math.floor(XP_BASE * Math.pow(level, XP_EXP));
+}
+function xpForEnemy(e) {
+  return Math.floor(e.maxHp / 10);
+}
+
 // ---------- предметы ----------
 const ITEMS = {
   cheese:  { name: 'Сыр',    color: '#f1c40f' },
@@ -181,6 +192,8 @@ const ITEMS = {
   floor:   { name: 'Плита',  color: '#95a5a6' },
   grass:   { name: 'Трава',  color: '#27ae60' },
   water:   { name: 'Вода',   color: '#2980b9' },
+  brick:   { name: 'Кирпич', color: '#b08d57' },
+  medkit:  { name: 'Аптечка', color: '#e74c3c' },
 };
 const TILE_TO_ITEM = {
   [T_STONE]: 'stone',
@@ -192,6 +205,56 @@ const TILE_TO_ITEM = {
 function addItem(player, itemId) {
   if (!player.inventory) player.inventory = {};
   player.inventory[itemId] = (player.inventory[itemId] || 0) + 1;
+}
+
+// ---------- крафт ----------
+const RECIPES = {
+  brick: { out: 'brick', need: { stone: 2 }, alt: { socks: 3 } },
+  medkit: { out: 'medkit', need: { cheese: 2, kuraga: 1 } },
+};
+const EAT_HP = { medkit: 60, cheese: 12, kuraga: 8 };
+const PLACE_RANGE = 130;
+function hasItems(p, need) {
+  if (!p.inventory) return false;
+  for (const k of Object.keys(need)) if ((p.inventory[k] || 0) < need[k]) return false;
+  return true;
+}
+function takeItems(p, need) {
+  if (!hasItems(p, need)) return false;
+  for (const k of Object.keys(need)) { p.inventory[k] -= need[k]; if (p.inventory[k] <= 0) delete p.inventory[k]; }
+  return true;
+}
+function doCraft(p, recipe) {
+  const r = RECIPES[recipe]; if (!r) return;
+  if (!p.inventory) p.inventory = {};
+  if (hasItems(p, r.need)) takeItems(p, r.need);
+  else if (r.alt && hasItems(p, r.alt)) takeItems(p, r.alt);
+  else return;
+  addItem(p, r.out);
+}
+function doEat(p, item) {
+  const ids = (item && EAT_HP[item]) ? [item] : ['medkit', 'cheese', 'kuraga'];
+  if (p.hp >= p.maxHp) return;
+  for (const id of ids) {
+    if ((p.inventory[id] || 0) > 0) {
+      p.inventory[id]--; if (p.inventory[id] <= 0) delete p.inventory[id];
+      p.hp = Math.min(p.maxHp, p.hp + EAT_HP[id]);
+      return;
+    }
+  }
+}
+function doPlace(p, tx, ty) {
+  if (!p.inventory || (p.inventory.brick || 0) <= 0) return;
+  if (tx < 1 || ty < 1 || tx >= MAP_W - 1 || ty >= MAP_H - 1) return;
+  const t = map[ty][tx];
+  if (t !== T_GRASS && t !== T_FLOOR) return;
+  const cx = tx * TILE + TILE / 2, cy = ty * TILE + TILE / 2;
+  if (Math.hypot(p.x - cx, p.y - cy) > PLACE_RANGE) return;
+  for (const o of players.values()) if (Math.hypot(o.x - cx, o.y - cy) < 20) return;
+  p.inventory.brick--; if (p.inventory.brick <= 0) delete p.inventory.brick;
+  map[ty][tx] = T_STONE;
+  wallHP.delete(tx + ',' + ty);
+  broadcast({ type: 'tileChange', tx, ty, tile: T_STONE });
 }
 
 // ---------- спавн ----------
@@ -299,9 +362,48 @@ function resetGame() {
   for (const p of players.values()) {
     const s = findSpawn();
     p.x = s.x; p.y = s.y;
+    p.maxHp = PLAYER_HP;
     p.hp = p.maxHp;
     p.dirX = 0; p.dirY = 0;
     p.inventory = {};
+    p.level = 1;
+    p.xp = 0;
+    p.xpNext = xpForLevel(1);
+    p.points = 0;
+    p.upgrades = { maxHp: 0, damage: 0, speed: 0 };
+  }
+}
+
+// ---------- прогрессия ----------
+function getDamageMult(p) {
+  return 1 + 0.10 * (p.upgrades ? p.upgrades.damage : 0);
+}
+function getSpeedMult(p) {
+  return 1 + 0.05 * (p.upgrades ? p.upgrades.speed : 0);
+}
+function grantLevelUps(p) {
+  while (p.xp >= p.xpNext) {
+    p.level++;
+    p.points++;
+    p.xpNext = xpForLevel(p.level);
+    broadcast({ type: 'levelUp', id: p.id, level: p.level, points: p.points, xpNext: p.xpNext });
+  }
+}
+function distributeXp(deathX, deathY, xpTotal, killerId) {
+  const eligible = [...players.values()].filter((pl) => Math.hypot(pl.x - deathX, pl.y - deathY) <= XP_SHARE_RADIUS);
+  const list = eligible.length ? eligible : (players.get(killerId) ? [players.get(killerId)] : []);
+  if (!list.length) return;
+  const share = Math.floor(xpTotal / list.length);
+  const remainder = xpTotal - share * list.length;
+  let extraId = list[0].id;
+  for (const pl of list) {
+    if (pl.id === killerId) { extraId = killerId; break; }
+  }
+  for (const pl of list) {
+    let gain = share;
+    if (pl.id === extraId) gain += remainder;
+    pl.xp += gain;
+    grantLevelUps(pl);
   }
 }
 
@@ -362,6 +464,8 @@ wss.on('connection', (ws) => {
     hp: PLAYER_HP, maxHp: PLAYER_HP,
     dirX: 0, dirY: 0,
     inventory: {},
+    level: 1, xp: 0, xpNext: xpForLevel(1), points: 0,
+    upgrades: { maxHp: 0, damage: 0, speed: 0 },
   };
   players.set(id, player);
   ws.playerId = id;
@@ -429,11 +533,33 @@ wss.on('connection', (ws) => {
         ownerType: 'player',
         ownerId: id, ttl: PROJ_TTL,
         maxDist: PROJ_MAX_DIST,
-        damage: PROJ_DAMAGE,
+        damage: Math.round(PROJ_DAMAGE * getDamageMult(p)),
       });
     } else if (msg.type === 'melee') {
       if (gameState !== 'playing') return;
       meleeStrike(p, Number(msg.angle) || 0);
+    } else if (msg.type === 'spendPoint') {
+      const stat = String(msg.stat || '');
+      if (stat !== 'maxHp' && stat !== 'damage' && stat !== 'speed') return;
+      if (!(p.points > 0)) return;
+      if (!p.upgrades) p.upgrades = { maxHp: 0, damage: 0, speed: 0 };
+      p.points--;
+      if (stat === 'maxHp') {
+        p.upgrades.maxHp++;
+        p.maxHp += 20;
+        p.hp = Math.min(p.maxHp, p.hp + 20);
+      } else {
+        p.upgrades[stat]++;
+      }
+    } else if (msg.type === 'craft') {
+      if (gameState !== 'playing') return;
+      doCraft(p, String(msg.recipe || ''));
+    } else if (msg.type === 'eat') {
+      if (gameState !== 'playing') return;
+      doEat(p, msg.item ? String(msg.item) : null);
+    } else if (msg.type === 'place') {
+      if (gameState !== 'playing') return;
+      doPlace(p, Math.floor(Number(msg.tx)), Math.floor(Number(msg.ty)));
     }
   });
 
@@ -455,8 +581,8 @@ wss.on('connection', (ws) => {
 // ---------- игровой тик ----------
 function movePlayer(p, dt) {
   const len = Math.hypot(p.dirX, p.dirY) || 1;
-  const nx = (p.dirX / len) * PLAYER_SPEED * dt;
-  const ny = (p.dirY / len) * PLAYER_SPEED * dt;
+  const nx = (p.dirX / len) * PLAYER_SPEED * getSpeedMult(p) * dt;
+  const ny = (p.dirY / len) * PLAYER_SPEED * getSpeedMult(p) * dt;
   const newX = p.x + nx, newY = p.y + ny;
   if (!isSolid(newX, p.y)) p.x = newX;
   if (!isSolid(p.x, newY)) p.y = newY;
@@ -590,6 +716,7 @@ function updateProjectiles(dt, now) {
             if (killer && Math.random() < LOOT_CHANCE) {
               addItem(killer, cfg.loot);
             }
+            distributeXp(e.x, e.y, xpForEnemy(e), pr.ownerId);
             enemies.delete(e.id);
           }
           hit = true;
