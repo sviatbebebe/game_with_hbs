@@ -49,8 +49,10 @@
     text-shadow: 0 1px 2px #000;
   }
   #controls {
-    position: fixed; bottom: 10px; left: 10px; font-size: 12px; color: #888;
-    pointer-events: none;
+    position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: #888; pointer-events: none;
+    background: rgba(0,0,0,0.5); padding: 4px 10px; border-radius: 6px;
+    white-space: nowrap; max-width: 95vw; overflow: hidden; text-overflow: ellipsis;
   }
 </style>
 </head>
@@ -75,11 +77,14 @@
 <div id="gameUI">
   <canvas id="game"></canvas>
   <div id="hud"></div>
-  <div id="controls">WASD — движение, ЛКМ — выстрел, ПКМ — удар по стене, F+ЛКМ — построить, E — съесть, C — крафт</div>
+  <div id="controls">WASD — движение, ЛКМ — выстрел, ПКМ — руда/стена, F+ЛКМ — стена, G+ЛКМ — печь 2x2, E — съесть/печка, С — крафт, P — админка</div>
 </div>
 
 <script type="module" src="/js/main.js"></script>
 <script type="module" src="/js/spend-ui.js"></script>
 <script type="module" src="/js/craft-ui.js"></script>
+<script type="module" src="/js/furnace-ui.js"></script>
+<script type="module" src="/js/mod-ui.js"></script>
+<script type="module" src="/js/admin-ui.js"></script>
 </body>
 </html>

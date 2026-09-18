@@ -1,5 +1,6 @@
 import { Net } from './net.js';
 import { Input } from './input.js';
+import { Fx } from './fx.js';
 
 const lobbyEl   = document.getElementById('lobby');
 const gameUIEl  = document.getElementById('gameUI');
@@ -20,11 +21,37 @@ const T_GRASS = 0;
 const T_STONE = 1;
 const T_WATER = 2;
 const T_FLOOR = 3;
+const T_IRON = 4;
+const T_COPPER = 5;
+const T_COAL = 6;
+const T_TIN = 7;
+const T_FURNACE = 8;
 
 const net = new Net();
 const input = new Input();
+const fx = new Fx();
+// последние известные позиции снарядов — для искр попаданий
+const lastProjPos = new Map();
 
-window.gameApi = { sendSpendPoint: (stat) => net.sendSpendPoint(stat), sendCraft: (recipe) => net.sendCraft(recipe), sendEat: (item) => net.sendEat(item), sendPlace: (tx, ty) => net.sendPlace(tx, ty), getLocalPlayer: () => net.getSelf() };
+window.gameApi = {
+  sendSpendPoint: (stat) => net.sendSpendPoint(stat),
+  sendCraft: (recipe) => net.sendCraft(recipe),
+  sendEat: (item) => net.sendEat(item),
+  sendPlace: (tx, ty) => net.sendPlace(tx, ty),
+  sendPlaceFurnace: (tx, ty) => net.sendPlaceFurnace(tx, ty),
+  sendFurnacePut: (id, item, count) => net.sendFurnacePut(id, item, count),
+  sendFurnaceTake: (id) => net.sendFurnaceTake(id),
+  sendChooseMod: (mod) => net.sendChooseMod(mod),
+  sendAdminSet: (damage, speed) => net.sendAdminSet(damage, speed),
+  sendAdminLevel: (level) => net.sendAdminLevel(level),
+  sendAdminGod: (on) => net.sendAdminGod(on),
+  sendAdminGive: (item, count) => net.sendAdminGive(item, count),
+  sendAdminSpawn: (enemyType, count) => net.sendAdminSpawn(enemyType, count),
+  getLocalPlayer: () => net.getSelf(),
+  getFurnaces: () => [...net.furnaces.values()],
+  isHost: () => net.id != null && net.id === net.hostId,
+  getNet: () => net,
+};
 
 const camera = { x: 0, y: 0 };
 let mapData = null;
@@ -43,6 +70,21 @@ window.addEventListener('mousemove', (e) => {
   input.mouse.y = e.clientY;
 });
 window.addEventListener('contextmenu', (e) => e.preventDefault());
+// зажатая ЛКМ — нужна скорострельному моду
+let mouseHeld = false;
+let lastAutoShot = 0;
+function shootAt(clientX, clientY) {
+  if (!myPlayer || net.gameState !== 'playing') return;
+  const wx = clientX + camera.x;
+  const wy = clientY + camera.y;
+  const angle = Math.atan2(wy - myPlayer.y, wx - myPlayer.x);
+  net.sendAttack(angle);
+  // вспышка у дула (пули теперь появляются ближе в 2 раза)
+  const off = (myPlayer.radius + 4) / 2;
+  const big = myPlayer.shotMod === 'shotgun';
+  fx.muzzle(myPlayer.x + Math.cos(angle) * off, myPlayer.y + Math.sin(angle) * off,
+    angle, big ? '#f39c12' : '#f1c40f', big);
+}
 window.addEventListener('mousedown', (e) => {
   if (!myPlayer || net.gameState !== 'playing') return;
   const wx = e.clientX + camera.x;
@@ -52,12 +94,51 @@ window.addEventListener('mousedown', (e) => {
     net.sendPlace(Math.floor(wx / TILE), Math.floor(wy / TILE));
     return;
   }
-  if (e.button === 0) net.sendAttack(angle);
+  if (e.button === 0 && input.isDown('KeyG')) {
+    // печка занимает 2x2, шлём левый верхний угол
+    net.sendPlaceFurnace(Math.floor(wx / TILE), Math.floor(wy / TILE));
+    return;
+  }
+  if (e.button === 0) {
+    mouseHeld = true;
+    input.mouse.down = true;
+    lastAutoShot = performance.now();
+    shootAt(e.clientX, e.clientY);
+  }
   else if (e.button === 2) net.sendMelee(angle);
 });
+window.addEventListener('mouseup', (e) => {
+  if (e.button === 0) { mouseHeld = false; input.mouse.down = false; }
+});
+window.addEventListener('blur', () => { mouseHeld = false; input.mouse.down = false; });
+
+function nearestFurnace(maxDist) {
+  if (!myPlayer) return null;
+  let best = null, bestD = Infinity;
+  for (const f of net.furnaces.values()) {
+    const cx = f.tx * TILE + TILE;
+    const cy = f.ty * TILE + TILE;
+    const d = Math.hypot(myPlayer.x - cx, myPlayer.y - cy);
+    if (d < maxDist && d < bestD) { bestD = d; best = f; }
+  }
+  return best;
+}
 
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'KeyE' && !e.repeat && net.gameState === 'playing') net.sendEat();
+  if (e.code === 'KeyE' && !e.repeat && net.gameState === 'playing') {
+    if (e.defaultPrevented) return;
+    if (window._furnaceClosedAt && Date.now() - window._furnaceClosedAt < 300) return;
+    // если окно печки уже открыто — пусть закроется само
+    if (window.furnaceUi && window.furnaceUi.isOpen && window.furnaceUi.isOpen()) return;
+    // если рядом печка — открыть её интерфейс, иначе съесть еду
+    const f = nearestFurnace(160);
+    if (f && window.furnaceUi) {
+      window.furnaceUi.open(f.id);
+      e.preventDefault();
+      return;
+    }
+    net.sendEat();
+  }
 });
 
 // ---------- процедурный шум для текстур ----------
@@ -143,6 +224,47 @@ function drawTile(tx, ty, t, px, py) {
     ctx.fillRect(px + TILE - 10, py + TILE - 10, 3, 3);
     ctx.fillStyle = 'rgba(0,0,0,0.15)';
     ctx.fillRect(px + TILE - 8, py + 6, 3, 3);
+  } else if (t === T_IRON || t === T_COPPER || t === T_COAL || t === T_TIN) {
+    // рудные жилы: каменная основа + цветные вкрапления
+    ctx.fillStyle = '#5a5a5a';
+    ctx.fillRect(px, py, TILE, TILE);
+    ctx.fillStyle = '#4a4a4a';
+    ctx.fillRect(px, py + TILE - 6, TILE, 6);
+    ctx.fillStyle = '#6e6e6e';
+    ctx.fillRect(px, py, TILE, 4);
+    const oreColor = t === T_IRON ? '#dfe6e9'
+      : t === T_COPPER ? '#e67e22'
+      : t === T_COAL ? '#1a1a1a'
+      : '#aef1f1';
+    ctx.fillStyle = oreColor;
+    for (let i = 0; i < 5; i++) {
+      const rx = hash2(tx * 5 + i * 3, ty * 7 + i);
+      const ry = hash2(tx * 11 + i, ty * 5 + i * 2);
+      const x = px + 4 + rx * (TILE - 10);
+      const y = py + 4 + ry * (TILE - 10);
+      ctx.fillRect(x, y, 5, 5);
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.fillRect(x, y, 2, 2);
+      ctx.fillStyle = oreColor;
+    }
+    ctx.strokeStyle = '#2b2b2b';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px + 0.5, py + 0.5, TILE - 1, TILE - 1);
+  } else if (t === T_FURNACE) {
+    // печка 2x2: кирпичная кладка с топкой
+    ctx.fillStyle = '#7e5109';
+    ctx.fillRect(px, py, TILE, TILE);
+    ctx.fillStyle = '#935e0b';
+    ctx.fillRect(px + 2, py + 2, TILE - 4, TILE - 4);
+    ctx.strokeStyle = '#4a2f05';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px + 4.5, py + 4.5, TILE - 9, TILE - 9);
+    ctx.strokeRect(px + 0.5, py + 0.5, TILE - 1, TILE - 1);
+    // топочное отверстие
+    ctx.fillStyle = '#1a0f00';
+    ctx.fillRect(px + 9, py + 18, TILE - 18, 10);
+    ctx.fillStyle = 'rgba(255,120,0,0.8)';
+    ctx.fillRect(px + 11, py + 20, TILE - 22, 3);
   }
 }
 
@@ -236,6 +358,7 @@ startBtn.addEventListener('click', () => net.startGame());
 
 net.on('init', (msg) => {
   mapData = msg.map;
+  renderMinimapBase();
   if (msg.gameState === 'playing') showGame();
   else showLobby();
 });
@@ -246,11 +369,23 @@ net.on('started', () => showGame());
 net.on('state', () => {
   if (net.gameState === 'playing' && gameUIEl.style.display === 'none') showGame();
 });
+net.on('tileChange', (msg) => {
+  updateMinimapTile(msg.tx, msg.ty, msg.tile);
+});
 
 setInterval(() => {
   if (net.gameState !== 'playing') return;
   const mv = input.getMove();
   net.sendMove(mv.dx, mv.dy);
+  // скорострел: огонь с зажатой ЛКМ
+  const self = net.getSelf();
+  if (mouseHeld && self && self.shotMod === 'rapid') {
+    const now = performance.now();
+    if (now - lastAutoShot >= 160) {
+      lastAutoShot = now;
+      shootAt(input.mouse.x, input.mouse.y);
+    }
+  }
 }, 50);
 
 // ---------- инвентарь ----------
@@ -331,6 +466,22 @@ function drawProgress(p) {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText('Ур. ' + level + '  Опыт ' + xp + '/' + xpNext + '  Очки: ' + pts, canvas.width / 2, y + h + 10);
+  // патроны и перезарядка
+  const ammo = (p.ammo != null ? p.ammo : 10);
+  const maxAmmo = p.maxAmmo || 10;
+  const reloading = p.reloadingUntil && p.reloadingUntil > Date.now();
+  const ay = y - 14;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(x, ay, w, 8);
+  ctx.fillStyle = reloading ? '#e74c3c' : '#f1c40f';
+  ctx.fillRect(x, ay, w * Math.max(0, ammo / maxAmmo), 8);
+  ctx.strokeStyle = '#444';
+  ctx.strokeRect(x + 0.5, ay + 0.5, w - 1, 7);
+  ctx.fillStyle = reloading ? '#e74c3c' : '#f1c40f';
+  ctx.font = '11px monospace';
+  const modName = p.shotMod === 'shotgun' ? 'Дробь x5' : p.shotMod === 'rapid' ? 'Скорострел' : 'Обычный';
+  ctx.fillText(reloading ? 'Перезарядка...' : 'Патроны ' + ammo + '/' + maxAmmo + '  •  ' + modName,
+    canvas.width / 2, ay - 8);
 }
 
 // ---------- интерполяция между серверными снапшотами ----------
@@ -342,6 +493,95 @@ function interpPos(o) {
   const iv = Math.max(1, net.stateInterval || 63);
   const a = Math.min(1, (performance.now() - net.lastStateAt) / iv);
   return { x: o.px + dx * a, y: o.py + dy * a };
+}
+
+// ---------- миникарта (левый нижний угол) ----------
+const MINIMAP_W = 190;
+const MINIMAP_H = 142;
+const minimapBase = document.createElement('canvas');
+function minimapColor(t) {
+  if (t === T_STONE) return '#6a6a6a';
+  if (t === T_WATER) return '#1a3a5c';
+  if (t === T_FLOOR) return '#3a3a3a';
+  if (t === T_IRON) return '#dfe6e9';
+  if (t === T_COPPER) return '#b87333';
+  if (t === T_COAL) return '#111111';
+  if (t === T_TIN) return '#aef1f1';
+  if (t === T_FURNACE) return '#e67e22';
+  return '#2b4426';
+}
+function renderMinimapBase() {
+  if (!mapData) return;
+  minimapBase.width = mapData.w;
+  minimapBase.height = mapData.h;
+  const mctx = minimapBase.getContext('2d');
+  const img = mctx.createImageData(mapData.w, mapData.h);
+  const tiles = mapData.tiles;
+  for (let y = 0; y < mapData.h; y++) {
+    const row = tiles[y];
+    for (let x = 0; x < mapData.w; x++) {
+      const t = row[x];
+      const i = (y * mapData.w + x) * 4;
+      let r = 43, g = 68, b = 38;
+      if (t === T_STONE) { r = 106; g = 106; b = 106; }
+      else if (t === T_WATER) { r = 26; g = 58; b = 92; }
+      else if (t === T_FLOOR) { r = 58; g = 58; b = 58; }
+      else if (t === T_IRON) { r = 223; g = 230; b = 233; }
+      else if (t === T_COPPER) { r = 184; g = 115; b = 51; }
+      else if (t === T_COAL) { r = 20; g = 20; b = 20; }
+      else if (t === T_TIN) { r = 174; g = 241; b = 241; }
+      else if (t === T_FURNACE) { r = 230; g = 126; b = 34; }
+      img.data[i] = r; img.data[i + 1] = g; img.data[i + 2] = b; img.data[i + 3] = 255;
+    }
+  }
+  mctx.putImageData(img, 0, 0);
+}
+function updateMinimapTile(tx, ty, t) {
+  if (!minimapBase.width) return;
+  const mctx = minimapBase.getContext('2d');
+  mctx.fillStyle = minimapColor(t);
+  mctx.fillRect(tx, ty, 1, 1);
+}
+function drawMinimap() {
+  if (!mapData || !minimapBase.width) return;
+  const mx = 10;
+  const my = canvas.height - MINIMAP_H - 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(mx - 2, my - 2, MINIMAP_W + 4, MINIMAP_H + 4);
+  ctx.drawImage(minimapBase, mx, my, MINIMAP_W, MINIMAP_H);
+  ctx.strokeStyle = '#444';
+  ctx.strokeRect(mx - 1.5, my - 1.5, MINIMAP_W + 3, MINIMAP_H + 3);
+  const sx = MINIMAP_W / mapData.w;
+  const sy = MINIMAP_H / mapData.h;
+  // враги — красные точки
+  ctx.fillStyle = '#e74c3c';
+  for (const e of net.enemies.values()) {
+    ctx.fillRect(mx + e.x / TILE * sx - 1, my + e.y / TILE * sy - 1, 2, 2);
+  }
+  // печки — оранжевые квадраты
+  ctx.fillStyle = '#f39c12';
+  for (const f of net.furnaces.values()) {
+    ctx.fillRect(mx + f.tx * sx - 1, my + f.ty * sy - 1, 3, 3);
+  }
+  // другие игроки — синие
+  ctx.fillStyle = '#3498db';
+  for (const p of net.players.values()) {
+    if (myPlayer && p.id === myPlayer.id) continue;
+    ctx.fillRect(mx + p.x / TILE * sx - 1, my + p.y / TILE * sy - 1, 2, 2);
+  }
+  // я — зелёный + рамка обзора
+  if (myPlayer) {
+    const vx = camera.x / TILE * sx;
+    const vy = camera.y / TILE * sy;
+    const vw = canvas.width / TILE * sx;
+    const vh = canvas.height / TILE * sy;
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.strokeRect(mx + vx, my + vy, vw, vh);
+    ctx.fillStyle = '#2ecc71';
+    ctx.beginPath();
+    ctx.arc(mx + myPlayer.x / TILE * sx, my + myPlayer.y / TILE * sy, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }
 
 // ---------- отрисовка ----------
@@ -416,16 +656,77 @@ function draw() {
     ctx.strokeStyle = '#58d68d'; ctx.lineWidth = 2; ctx.stroke();
   }
 
-  // снаряды
-  for (const pr of net.projectiles.values()) {
-    const qp = interpPos(pr); const sx = qp.x + ox, sy = qp.y + oy;
-    if (pr.ownerType === 'enemy') {
-      ctx.fillStyle = '#e67e22';
-      ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = '#d35400'; ctx.lineWidth = 1; ctx.stroke();
-    } else {
-      ctx.fillStyle = '#f1c40f';
-      ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.fill();
+  // снаряды — продолговатые, вдоль вектора скорости
+  {
+    const seen = new Set();
+    for (const pr of net.projectiles.values()) {
+      seen.add(pr.id);
+      lastProjPos.set(pr.id, { x: pr.x, y: pr.y, ownerType: pr.ownerType });
+      const qp = interpPos(pr); const sx = qp.x + ox, sy = qp.y + oy;
+      const ang = Math.atan2(pr.vy || 0, pr.vx || 1);
+      const enemy = pr.ownerType === 'enemy';
+      const body = enemy ? '#e67e22' : '#f1c40f';
+      const edge = enemy ? '#d35400' : '#f39c12';
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(ang);
+      // светящаяся подложка
+      ctx.fillStyle = enemy ? 'rgba(230,126,34,0.25)' : 'rgba(241,196,15,0.25)';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 11, 6, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // корпус пули
+      ctx.fillStyle = body;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 9, 3.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = edge;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // яркий носик
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(4, -1.2, 4, 2.4);
+      ctx.restore();
+    }
+    // исчезнувшие снаряды — искры попаданий (не больше 5 за кадр)
+    let bursts = 0;
+    for (const [id, pos] of [...lastProjPos]) {
+      if (!seen.has(id)) {
+        if (bursts < 5) {
+          fx.impact(pos.x, pos.y, pos.ownerType === 'enemy' ? '#e67e22' : '#f1c40f');
+          bursts++;
+        }
+        lastProjPos.delete(id);
+      }
+    }
+    if (lastProjPos.size > 600) {
+      // страховка от утечки при лагах
+      for (const id of [...lastProjPos.keys()].slice(0, lastProjPos.size - 600)) lastProjPos.delete(id);
+    }
+  }
+  fx.update(1 / 60);
+  fx.draw(ctx, ox, oy);
+
+  // печки: прогресс плавки над центром 2x2
+  for (const f of net.furnaces.values()) {
+    const cx = f.tx * TILE + TILE + ox;
+    const cy = f.ty * TILE + TILE + oy;
+    if (cx < -80 || cy < -40 || cx > canvas.width + 80 || cy > canvas.height + 40) continue;
+    if (f.smelting) {
+      const ratio = f.smelting.total > 0 ? 1 - f.smelting.remaining / f.smelting.total : 0;
+      ctx.fillStyle = '#222';
+      ctx.fillRect(cx - 32, cy - 44, 64, 6);
+      ctx.fillStyle = '#f39c12';
+      ctx.fillRect(cx - 32, cy - 44, 64 * Math.max(0, Math.min(1, ratio)), 6);
+      ctx.fillStyle = '#fff';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(f.smelting.type.replace('_ore', ''), cx, cy - 48);
+    } else if ((f.coal || 0) > 0 || (f.charges || 0) > 0) {
+      ctx.fillStyle = 'rgba(243,156,18,0.9)';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('🔥', cx, cy - 44);
     }
   }
 
@@ -444,10 +745,13 @@ function draw() {
   // инвентарь
   drawInventory(myPlayer);
   drawProgress(myPlayer);
+  drawMinimap();
 
-  // HUD (снизу слева, чтобы не мешать инвентарю)
+  // HUD (сверху слева, миникарта теперь слева внизу)
+  const godTag = myPlayer.god ? '  БОГ' : '';
   hud.textContent = 'HP: ' + Math.max(0, Math.round(myPlayer.hp)) + '/' + myPlayer.maxHp
-                  + '   Врагов: ' + net.enemies.size;
+                  + '   Врагов: ' + net.enemies.size + '/' + 300
+                  + '   Печек: ' + net.furnaces.size + godTag;
 }
 draw();
 

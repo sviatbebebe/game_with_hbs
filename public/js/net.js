@@ -6,6 +6,7 @@ export class Net {
     this.players = new Map();
     this.enemies = new Map();
     this.projectiles = new Map();
+    this.furnaces = new Map();
     this.map = null;
     this.items = {};
     this.ws = null;
@@ -41,6 +42,7 @@ export class Net {
       this.players.clear(); msg.players.forEach(p => this.players.set(p.id, p));
       this.enemies.clear(); msg.enemies.forEach(e => this.enemies.set(e.id, e));
       this.projectiles.clear(); msg.projectiles.forEach(p => this.projectiles.set(p.id, p));
+      this.furnaces.clear(); (msg.furnaces || []).forEach(f => this.furnaces.set(f.id, f));
       this.emit('init', msg);
     } else if (msg.type === 'lobby') {
       this.hostId = msg.hostId;
@@ -88,6 +90,17 @@ export class Net {
       merge(this.players, msg.players);
       merge(this.enemies, msg.enemies);
       merge(this.projectiles, msg.projectiles);
+      // печки не интерполируем, просто заменяем
+      if (msg.furnaces) {
+        const seen = new Set();
+        msg.furnaces.forEach(f => {
+          seen.add(f.id);
+          const ex = this.furnaces.get(f.id);
+          if (ex) Object.assign(ex, f);
+          else this.furnaces.set(f.id, f);
+        });
+        for (const k of [...this.furnaces.keys()]) if (!seen.has(k)) this.furnaces.delete(k);
+      }
       this.emit('state', msg);
     }
   }
@@ -106,4 +119,14 @@ export class Net {
   sendCraft(recipe) { this._send({ type: 'craft', recipe }); }
   sendEat(item) { if (item) this._send({ type: 'eat', item }); else this._send({ type: 'eat' }); }
   sendPlace(tx, ty) { this._send({ type: 'place', tx, ty }); }
+  sendPlaceFurnace(tx, ty) { this._send({ type: 'placeFurnace', tx, ty }); }
+  sendFurnacePut(furnaceId, item, count) { this._send({ type: 'furnacePut', furnaceId, item, count }); }
+  sendFurnaceTake(furnaceId) { this._send({ type: 'furnaceTake', furnaceId }); }
+  sendChooseMod(mod) { this._send({ type: 'chooseMod', mod }); }
+  sendAdminSet(damage, speed) { this._send({ type: 'adminSet', damage, speed }); }
+  sendAdminLevel(level) { this._send({ type: 'adminLevel', level }); }
+  sendAdminGod(on) { this._send({ type: 'adminGod', on }); }
+  sendAdminGive(item, count) { this._send({ type: 'adminGive', item, count }); }
+  sendAdminSpawn(enemyType, count) { this._send({ type: 'adminSpawn', enemyType, count }); }
+  getFurnaces() { return this.furnaces; }
 }
